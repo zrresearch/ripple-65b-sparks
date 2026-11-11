@@ -1,0 +1,8 @@
+ -- Loading /home/user/models/Ripple-65B-Preview-exl3-5.0bpw
+ -- Warming up...
+ -- Loading tokenizer...
+ -- Model: /home/user/models/Ripple-65B-Preview-exl3-5.0bpw
+ -- Bitrate: 5.00 bpw / 8.00 bpw (head)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+ -- Evaluated: 64 rows of 2048 tokens
+ -- Perplexity: 9.292574

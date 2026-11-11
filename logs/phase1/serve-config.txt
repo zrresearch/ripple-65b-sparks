@@ -1,0 +1,5 @@
+# 2026-11-11T11:08:25+00:00 scripts/start.sh
+pack /home/user/models/Ripple-65B-Preview-exl3-5.0bpw
+build /home/user/ripple/tensorfold/zig-out aec60ed51ee48520 904dee9b40df8792 
+rank0 --gpus all --ipc=host --network host --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 --user 1000:1000 -e HOME=/tmp -v /home/user/models/Ripple-65B-Preview-exl3-5.0bpw:/home/user/models/Ripple-65B-Preview-exl3-5.0bpw:ro -v /home/user/ripple/tensorfold:/home/user/ripple/tensorfold:ro -e NCCL_COMM_ID=<addr>:29681 -e NCCL_SOCKET_IFNAME=<netdev> -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3 -e TF_ROCE_GID_INDEX=3 -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e TF_RICURSIVE_RANK=0 -e TF_RICURSIVE_WORLD=2 -e TF_RICURSIVE_CONTEXT=1048576 -e TF_RICURSIVE_SLOTS=1 -e TF_RICURSIVE_GRAPHS=1 -e TF_RICURSIVE_ROCE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=4 
+serve --parallel 1 --context 1048576 --max-tokens 32768  

@@ -1,0 +1,53 @@
+{
+ "coding": {
+  "runs": [
+   {
+    "completion_tokens": 487,
+    "first_token_s": 0.32,
+    "decode_tok_s": 38.74,
+    "chunks": 92
+   },
+   {
+    "completion_tokens": 487,
+    "first_token_s": 0.14,
+    "decode_tok_s": 33.48,
+    "chunks": 107
+   }
+  ],
+  "decode_tok_s": 36.11
+ },
+ "agent tool call": {
+  "runs": [
+   {
+    "completion_tokens": 512,
+    "first_token_s": 0.5,
+    "decode_tok_s": 32.5,
+    "chunks": 115
+   },
+   {
+    "completion_tokens": 512,
+    "first_token_s": 0.54,
+    "decode_tok_s": 30.63,
+    "chunks": 122
+   }
+  ],
+  "decode_tok_s": 31.56
+ },
+ "chat": {
+  "runs": [
+   {
+    "completion_tokens": 472,
+    "first_token_s": 0.32,
+    "decode_tok_s": 16.33,
+    "chunks": 212
+   },
+   {
+    "completion_tokens": 472,
+    "first_token_s": 0.13,
+    "decode_tok_s": 15.35,
+    "chunks": 227
+   }
+  ],
+  "decode_tok_s": 15.84
+ }
+}

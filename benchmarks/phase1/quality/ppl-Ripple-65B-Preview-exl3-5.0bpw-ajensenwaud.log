@@ -1,0 +1,14 @@
+ -- Loading /home/user/models/Ripple-65B-Preview-exl3-5.0bpw-ajensenwaud
+ -- Warming up...
+ -- Loading tokenizer...
+ -- Model: /home/user/models/Ripple-65B-Preview-exl3-5.0bpw-ajensenwaud
+ -- Bitrate: 5.00 bpw / 8.00 bpw (head)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Generating test split:   0%|          | 0/4358 [00:00<?, ? examples/s]
+Generating test split: 100%|██████████| 4358/4358 [00:00<00:00, 169240.10 examples/s]
+Generating train split:   0%|          | 0/36718 [00:00<?, ? examples/s]
+Generating train split: 100%|██████████| 36718/36718 [00:00<00:00, 1626926.13 examples/s]
+Generating validation split:   0%|          | 0/3760 [00:00<?, ? examples/s]
+Generating validation split: 100%|██████████| 3760/3760 [00:00<00:00, 1232076.80 examples/s]
+ -- Evaluated: 64 rows of 2048 tokens
+ -- Perplexity: 9.269462
