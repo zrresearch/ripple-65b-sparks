@@ -1,0 +1,494 @@
+From a9de80c69a0d055cd161270ed2444e5023bb342d Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:59:39 +0000
+Subject: [PATCH] ricursive: four ranks (TP=4) as well as one or two
+
+Admission takes 1, 2 or 4 ranks: 80 query heads, 8 key heads, the FFN, the vocabulary and the
+drafter all cut evenly at four, on whole 128-wide blocks. The forward, the header exchange, the
+follow loop, rankSum and the drafter were already written for any world.
+
+At four ranks TF_RICURSIVE_ROCE=1 opens fabric/tp's multirank wire for the small gathers (the
+same wire, probe and vote as GLM's cuda_roce_multi.zig); without its settings, or if any rank's
+probe differs from NCCL, every rank keeps NCCL. Two ranks keep their own RoCE wire.
+
+The family module imports fabric/tp; the native server shares GLM's instance, as one file
+belongs to one module.
+
+At two ranks the build is byte-identical to the previous one: greedy replies to four prompts,
+plain, drafted and four streams at once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/build/cuda_engines.zig                    |   6 +-
+ zig/build/ricursive.zig                       |  16 +-
+ zig/src/families/ricursive/cuda.zig           |   3 +-
+ zig/src/families/ricursive/cuda_forward.zig   |  19 +-
+ .../families/ricursive/cuda_roce_multi.zig    | 311 ++++++++++++++++++
+ 5 files changed, 341 insertions(+), 14 deletions(-)
+ create mode 100644 zig/src/families/ricursive/cuda_roce_multi.zig
+
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index 3caabee12..5855773b2 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -35,6 +35,8 @@ pub fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
+ /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
+ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+     const api = qwen35.import_table.get("engine_api").?; // family()'s, so the server and qwen3_5 share one
++    const glm = glmCuda(b, target, optimize, cuda, core, lanes, heat, api);
++    const tp = glm.import_table.get("tp").?; // GLM's fabric/tp, Ripple's too: one file belongs to one module
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+@@ -49,14 +51,14 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
+             .{ .name = "core", .module = core },
+             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api) },
+-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat, api) },
++            .{ .name = "glm_cuda", .module = glm },
+             .{ .name = "minimax_m3_cuda", .module = @import("minimax_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "qwen35", .module = qwen35 },
+             .{ .name = "kolibri1", .module = @import("kolibri.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "spark25", .module = @import("spark25.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "dory", .module = @import("dory.zig").module(b, target, optimize, cuda, core, lanes) },
+-            .{ .name = "ricursive_cuda", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } }) },
++            .{ .name = "ricursive_cuda", .module = @import("ricursive.zig").family(b, target, optimize, cuda, core, lanes, tp) },
+         },
+     });
+     mod.addImport("qwen4", @import("qwen4.zig").module(b, target, optimize, core));
+diff --git a/zig/build/ricursive.zig b/zig/build/ricursive.zig
+index b2f9774b9..bd1810402 100644
+--- a/zig/build/ricursive.zig
++++ b/zig/build/ricursive.zig
+@@ -1,18 +1,26 @@
+ //! Ripple's (ricursive) CUDA build steps: the parity/follow tool and the family's host tests.
+ const std = @import("std");
+ 
+-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
+-    return b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } });
++/// The family module: the runtime, the core, the lane core, and fabric/tp for four ranks' multirank RoCE (`shared_tp`:
++/// the build's own where another family already imports it, as one file belongs to one module; null makes one).
++pub fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, shared_tp: ?*std.Build.Module) *std.Build.Module {
++    const tp = shared_tp orelse blk: {
++        const t = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/tp.zig"), .target = target, .optimize = optimize, .link_libc = true });
++        t.addImport("cuda", cuda);
++        t.addImport("verbs", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/verbs.zig"), .target = target, .optimize = optimize, .link_libc = true }));
++        break :blk t;
++    };
++    return b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes }, .{ .name = "tp", .module = tp } } });
+ }
+ 
+ /// tf-ricursive: Ripple's CUDA forward rows (prompt and decode) for the exllamav3 parity check, and rank 1's follower.
+ pub fn tool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
+-    const root = b.createModule(.{ .root_source_file = b.path("zig/tests/ricursive_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "ricursive", .module = family(b, target, optimize, cuda, core, lanes) } } });
++    const root = b.createModule(.{ .root_source_file = b.path("zig/tests/ricursive_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "ricursive", .module = family(b, target, optimize, cuda, core, lanes, null) } } });
+     b.step("ricursive-cuda", "Build Ripple's CUDA forward rows tool").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-ricursive", .root_module = root }), .{}).step);
+ }
+ 
+ pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, all: *std.Build.Step) void {
+-    const run = b.addRunArtifact(b.addTest(.{ .root_module = family(b, b.graph.host, null, cuda, core, lanes) }));
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = family(b, b.graph.host, null, cuda, core, lanes, null) }));
+     all.dependOn(&run.step);
+     b.step("test-ricursive-host", "Ripple's CUDA family on the host: config, admission, TP cuts").dependOn(&run.step);
+ }
+diff --git a/zig/src/families/ricursive/cuda.zig b/zig/src/families/ricursive/cuda.zig
+index eebed10d6..881cca167 100644
+--- a/zig/src/families/ricursive/cuda.zig
++++ b/zig/src/families/ricursive/cuda.zig
+@@ -1,4 +1,4 @@
+-//! Ripple (model_type ricursive) on CUDA: an ExLlamaV3 pack on one or two GB10s (sm_121), main's operators.
++//! Ripple (model_type ricursive) on CUDA: an ExLlamaV3 pack on one, two or four GB10s (sm_121), main's operators.
+ const std = @import("std");
+ pub const config = @import("config.zig");
+ pub const kernels = @import("cuda_kernels.zig");
+@@ -41,4 +41,5 @@ test {
+     _ = @import("cuda_lanes.zig");
+     _ = @import("cuda_draft_load.zig");
+     _ = @import("cuda_draft.zig");
++    _ = @import("cuda_roce_multi.zig");
+ }
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index 76cc8ec33..82f56f0cf 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -1,5 +1,6 @@
+ //! Ripple's forward on GB10s: rows of one or more streams' cache slots, one rank or two (TP=2, rank 0 drives).
+ const std = @import("std");
++const roce_multi = @import("cuda_roce_multi.zig"); // four ranks: fabric/tp's multirank wire for small gathers
+ const cuda = @import("cuda");
+ const core = @import("core");
+ const config = @import("config.zig");
+@@ -37,17 +38,19 @@ pub fn place() !Place {
+     return p;
+ }
+ 
+-/// What has been validated: sm_121 (GB10) at one rank or two; every other SM or world is refused by name.
++/// What has been validated: sm_121 (GB10) at one, two or four ranks (80 query heads and 8 key heads cut evenly at each);
++/// every other SM or world is refused by name.
+ pub fn admit(sm: u32, world: usize) !void {
+     if (sm != 121) return error.RicursiveRequiresSm121;
+-    if (world != 1 and world != 2) return error.RicursiveTpNotValidated;
++    if (world != 1 and world != 2 and world != 4) return error.RicursiveTpNotValidated;
+ }
+ 
+-test "ricursive admission: sm_121 at one or two ranks only" {
++test "ricursive admission: sm_121 at one, two or four ranks only" {
+     try admit(121, 1);
+     try admit(121, 2);
++    try admit(121, 4);
+     for ([_]u32{ 80, 86, 89, 90, 100, 120 }) |sm| try std.testing.expectError(error.RicursiveRequiresSm121, admit(sm, 2));
+-    for ([_]usize{ 0, 3, 4, 8 }) |w| try std.testing.expectError(error.RicursiveTpNotValidated, admit(121, w));
++    for ([_]usize{ 0, 3, 5, 8 }) |w| try std.testing.expectError(error.RicursiveTpNotValidated, admit(121, w));
+ }
+ 
+ pub const Options = struct {
+@@ -58,7 +61,8 @@ pub const Options = struct {
+     place: Place = .{},
+     /// Full layers' prompt chunks on the window prompt rows (q padded); false: tree rows (prompt == decode bits).
+     full_prompt: bool = true,
+-    /// Two ranks' small gathers by RoCE writes (else NCCL carries every gather; the same bits).
++    /// Small gathers by RoCE writes: two ranks' own wire, or at four fabric/tp's multirank wire (else NCCL carries
++    /// every gather; the same bits).
+     roce: bool = false,
+     /// Decode rows (one row, its logits) replayed as CUDA graphs keyed by 64-group key buckets.
+     graphs: bool = false,
+@@ -130,7 +134,7 @@ pub const Model = struct {
+     draft_hook: ?*const fn (*Model, *const Header) anyerror!void = null,
+     draft_ptr: ?*anyopaque = null,
+ 
+-    /// Loads `dir` (a rank's share at two ranks) on the context's device; sm_121 only.
++    /// Loads `dir` (a rank's share at two or four ranks) on the context's device; sm_121 only.
+     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, d: *const cuda.Driver, dir: []const u8, o: Options) !*Model {
+         try admit(try ctx.capability(), o.place.world);
+         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+@@ -150,7 +154,8 @@ pub const Model = struct {
+         m.* = .{ .gpa = gpa, .io = io, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .o = o, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .tree = undefined, .k = undefined, .hq = c.heads / world, .hk = c.kv_heads / world, .ff = c.intermediate / world, .vr = c.vocab / world, .context = o.context, .slots = o.slots };
+         if (world > 1) {
+             m.group = try cuda.tp_group.Group.open(d, o.place.rank, world);
+-            if (o.roce) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
++            if (o.roce and world == 2) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
++            if (o.roce and world > 2) try roce_multi.open(gpa, io, d, &m.group.?, true);
+         }
+         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
+         m.dense = try cuda.exl3.Dense.load(d);
+diff --git a/zig/src/families/ricursive/cuda_roce_multi.zig b/zig/src/families/ricursive/cuda_roce_multi.zig
+new file mode 100644
+index 000000000..8e07a8dfb
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_roce_multi.zig
+@@ -0,0 +1,311 @@
++//! Ripple at four ranks with TF_RICURSIVE_ROCE=1: the main stream's small all-gathers on fabric/tp's multirank RoCE.
++//! The same wire, probe and vote as glm/cuda_roce_multi.zig, under Ripple's setting.
++const std = @import("std");
++const builtin = @import("builtin");
++const cuda = @import("cuda");
++const tp = @import("tp");
++
++const Group = cuda.tp_group.Group;
++
++/// Every rank opens the wire and lends it to `g` once every probe matched NCCL; one rank failing leaves all on NCCL.
++pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, g: *Group, on: bool) !void {
++    if (comptime builtin.os.tag != .linux) return; // fabric/tp's sockets and verbs
++    if (!on) return;
++    if (g.world < 3) {
++        if (g.rank == 0) std.log.info("TF_RICURSIVE_ROCE=1's multirank wire takes three ranks or more; {d} keep their own route", .{g.world});
++        return;
++    }
++    var cfg = try tp.Config.fromEnv(); // TF_TP_MASTER, TF_TP_PORT and the wire's settings: a bad value refuses
++    cfg.rank = @intCast(g.rank);
++    cfg.world = @intCast(g.world);
++    var entered = false; // this rank's probe enqueued NCCL's gather
++    const w = borrow(gpa, io, d, g, cfg, &entered) catch |err| {
++        // TF_TP_ROCE_FALLBACK=error refuses rather than run on NCCL, as does a failure NCCL's order may not survive
++        if (cfg.roce_fallback == .@"error" or !fallsBack(err, entered)) return err;
++        std.log.warn("rank {d}: TF_RICURSIVE_ROCE=1, but the wire did not open ({s}); NCCL keeps the small gathers", .{ g.rank, @errorName(err) });
++        return;
++    };
++    g.multi = .{ .ctx = w, .fits = fits, .gather = gather, .check = check, .abort = abort, .deinit = deinit };
++}
++
++/// Whether NCCL keeps the small gathers after `err`: no gather of the probe's entered yet, or every rank's verdict.
++fn fallsBack(err: anyerror, entered: bool) bool {
++    return !entered or err == error.ProbeMismatch;
++}
++
++/// fabric/tp's bootstrap, ports, wire and kernel, and a probe against the group's NCCL: each step every rank's or none.
++fn borrow(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, g: *const Group, cfg: tp.Config, entered: *bool) !*Wire {
++    const path = std.mem.span(std.c.getenv("TF_TP_KERNEL_IMAGE") orelse return error.NoKernelImage);
++    const image = try std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(1 << 26), .@"16", null);
++    defer gpa.free(image); // the module copies it at load
++    var b = try tp.Bootstrap.open(cfg);
++    defer b.close(); // the wire is connected by the end of init
++    try b.agree(&cfg.digest(), "fabric/tp settings (TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_WIRE, TF_TP_ROCE_FALLBACK)");
++    var specs: [tp.roce_verbs.max_hcas]tp.roce_verbs.HcaSpec = undefined;
++    var picked = true;
++    const n = if (cfg.roce_wire == .verbs) tp.roce_pick.resolve(cfg, &b, &specs) catch blk: {
++        picked = false;
++        break :blk 0;
++    } else 0;
++    if (!try everyRank(&b, picked)) return error.RoceHcaSelectionFailed;
++    const r = try tp.roce_multi.Roce.init(d, &b, image, .{ .wire = if (cfg.roce_wire == .shm) .shm else .verbs, .hcas = specs[0..n], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = cfg.mailbox_max_bytes, .timeout_ns = cfg.mailbox_timeout_ns, .fast = cfg.roce_fast, .blocks = cfg.roce_blocks });
++    errdefer r.deinit();
++    const w = try gpa.create(Wire); // before the last vote: nothing after it can fail
++    errdefer gpa.destroy(w);
++    w.* = .{ .gpa = gpa, .r = r, .rank = g.rank };
++    var p: Probe = .{ .gpa = gpa, .d = d, .g = g, .r = r };
++    defer p.deinit();
++    try vote(&b, p.steps(), entered);
++    var line: [384]u8 = undefined;
++    std.log.info("rank {d}: TF_RICURSIVE_ROCE (multirank): gathers up to {d} KiB a rank on the wire, its probe equal to NCCL's: {s}", .{ g.rank, r.slot_bytes / 1024, r.describeLink(&line) });
++    return w;
++}
++
++/// A rank's probe in steps (made ready before any gather, both gathers, the wait, the verdict); a test fails any.
++const Steps = struct {
++    ctx: *anyopaque,
++    prepare: *const fn (*anyopaque) anyerror!void,
++    wire: *const fn (*anyopaque) anyerror!void,
++    nccl: *const fn (*anyopaque) anyerror!void,
++    wait: *const fn (*anyopaque) anyerror!void,
++    equal: *const fn (*anyopaque) bool,
++};
++
++/// Every rank is ready before any enters a gather, then all enter both; a failed NCCL gather or wait refuses at once.
++fn vote(b: *tp.Bootstrap, s: Steps, entered: *bool) !void {
++    const ready = if (s.prepare(s.ctx)) |_| true else |_| false;
++    if (!try everyRank(b, ready)) return error.ProbeUnprepared;
++    const wired = if (s.wire(s.ctx)) |_| true else |_| false; // NCCL's gather follows it either way
++    entered.* = true;
++    try s.nccl(s.ctx);
++    try s.wait(s.ctx);
++    try lendIfAll(b, wired and s.equal(s.ctx));
++}
++
++/// One 4 KiB gather in place, on the wire and on the group's NCCL (no wire lent yet): every byte must be equal.
++const Probe = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    g: *const Group,
++    r: *tp.roce_multi.Roce,
++    a: ?cuda.DeviceBuffer = null, // the wire's rows, then NCCL's
++    s: ?cuda.Stream = null,
++
++    const n = 4096;
++
++    fn deinit(p: *Probe) void {
++        if (p.a) |*a| a.free();
++        if (p.s) |*s| s.deinit();
++    }
++
++    fn steps(p: *Probe) Steps {
++        return .{ .ctx = p, .prepare = prepare, .wire = wire, .nccl = nccl, .wait = wait, .equal = equal };
++    }
++
++    fn from(ctx: *anyopaque) *Probe {
++        return @ptrCast(@alignCast(ctx));
++    }
++
++    fn prepare(ctx: *anyopaque) anyerror!void {
++        const p = from(ctx);
++        const world = p.g.world;
++        p.a = try cuda.DeviceBuffer.alloc(p.d, 2 * world * n);
++        p.s = try cuda.Stream.init(p.d, true);
++        var mine: [n]u8 = undefined;
++        tp.reference.fill(&mine, .bf16, @intCast(p.g.rank), 0x7072_6f62);
++        try p.a.?.uploadAsync(p.g.rank * n, &mine, p.s.?.handle);
++        try p.a.?.uploadAsync((world + p.g.rank) * n, &mine, p.s.?.handle);
++        try p.s.?.synchronize(); // the rows are up before this rank says it is ready
++    }
++
++    fn wire(ctx: *anyopaque) anyerror!void {
++        const p = from(ctx);
++        try p.r.allGatherBytes(p.a.?.ptr + p.g.rank * n, p.a.?.ptr, n, p.s.?.handle);
++    }
++
++    fn nccl(ctx: *anyopaque) anyerror!void {
++        const p = from(ctx);
++        try p.g.allGather(p.s.?, p.a.?.ptr + (p.g.world + p.g.rank) * n, p.a.?.ptr + p.g.world * n, n);
++    }
++
++    fn wait(ctx: *anyopaque) anyerror!void {
++        try from(ctx).s.?.synchronize();
++    }
++
++    fn equal(ctx: *anyopaque) bool {
++        const p = from(ctx);
++        const world = p.g.world;
++        p.r.check() catch return false;
++        const got = p.gpa.alloc(u8, 2 * world * n) catch return false;
++        defer p.gpa.free(got);
++        p.a.?.download(0, got) catch return false;
++        const same = std.mem.eql(u8, got[0 .. world * n], got[world * n ..]);
++        if (!same) std.log.warn("rank {d}: TF_RICURSIVE_ROCE (multirank)'s probe: the wire's gather DIFFERS from NCCL's", .{p.g.rank});
++        return same;
++    }
++};
++
++/// The wire is lent only when every rank's probe matched NCCL's bytes: one rank's mismatch keeps every rank on NCCL.
++fn lendIfAll(b: *tp.Bootstrap, good: bool) !void {
++    if (!try everyRank(b, good)) return error.ProbeMismatch;
++}
++
++/// Every rank's vote over the bootstrap, the same answer on every rank.
++fn everyRank(b: *tp.Bootstrap, yes: bool) !bool {
++    var blobs: [tp.bootstrap.max_ranks][]const u8 = undefined;
++    var buf: [tp.bootstrap.max_ranks]u8 = undefined;
++    return allSaid(try b.allGather(&.{@intFromBool(yes)}, &buf, &blobs));
++}
++
++/// Whether every rank's one-byte vote is yes: every rank reads the same votes, so every rank decides alike.
++fn allSaid(votes: []const []const u8) bool {
++    for (votes) |v| if (v.len != 1 or v[0] != 1) return false;
++    return true;
++}
++
++/// The lent wire and what went down it, for its account at the end.
++const Wire = struct {
++    gpa: std.mem.Allocator,
++    r: *tp.roce_multi.Roce,
++    rank: usize,
++    gathers: std.atomic.Value(u64) = .init(0),
++    bytes: std.atomic.Value(u64) = .init(0),
++};
++
++fn of(ctx: *anyopaque) *Wire {
++    return @ptrCast(@alignCast(ctx));
++}
++
++fn fits(ctx: *anyopaque, bytes: usize) bool {
++    return of(ctx).r.fits(bytes);
++}
++
++fn gather(ctx: *anyopaque, s: cuda.abi.Stream, mine: cuda.abi.DevicePtr, all: cuda.abi.DevicePtr, bytes: usize) anyerror!void {
++    const w = of(ctx);
++    try w.r.allGatherBytes(mine, all, bytes, s);
++    // once: the engine's own gathers take the wire (a server's stop exits before any close prints the account)
++    if (w.gathers.fetchAdd(1, .monotonic) == 0) std.log.info("rank {d}: TF_RICURSIVE_ROCE (multirank): the first gather is on the wire ({d} bytes a rank)", .{ w.rank, bytes });
++    _ = w.bytes.fetchAdd(bytes, .monotonic);
++}
++
++fn check(ctx: *anyopaque) anyerror!void {
++    return of(ctx).r.check(); // a failed wait's line names the rank and seq it waited on
++}
++
++fn abort(ctx: *anyopaque) void {
++    const w = of(ctx);
++    w.r.abort();
++    report(w, "aborted");
++}
++
++fn deinit(ctx: *anyopaque) void {
++    const w = of(ctx);
++    report(w, "closing");
++    w.r.deinit();
++    w.gpa.destroy(w);
++}
++
++/// Gathers, bytes, the proxy's last post and failure, each HCA's QPs: a rank whose posts stop short is the stuck one.
++fn report(w: *const Wire, when: []const u8) void {
++    var line: [384]u8 = undefined;
++    const r = w.r;
++    const fmt = "rank {d}: TF_RICURSIVE_ROCE (multirank) {s}: {d} gathers, {d} bytes, posted to seq {d}, failed {s}{s}; {s}";
++    const args = .{ w.rank, when, w.gathers.load(.monotonic), w.bytes.load(.monotonic), r.last_seq, if (r.failed()) "yes " else "no", r.proxyError(), r.describeLink(&line) };
++    if (r.failed()) std.log.warn(fmt, args) else std.log.info(fmt, args);
++}
++
++test "TF_RICURSIVE_ROCE (multirank) off, or under three ranks: the group keeps its own route and nothing opens" {
++    var g: Group = .{ .lib = undefined, .comm = null, .rank = 0, .world = 3 };
++    try open(std.testing.allocator, undefined, undefined, &g, false);
++    try std.testing.expect(g.multi == null);
++    g.world = 2;
++    try open(std.testing.allocator, undefined, undefined, &g, true);
++    try std.testing.expect(g.multi == null);
++}
++
++test "the wire is lent only when every rank's vote is one byte saying yes" {
++    try std.testing.expect(allSaid(&.{ &.{1}, &.{1}, &.{1} }));
++    try std.testing.expect(!allSaid(&.{ &.{1}, &.{0}, &.{1} }));
++    try std.testing.expect(!allSaid(&.{ &.{1}, &.{}, &.{1} }));
++    try std.testing.expect(!allSaid(&.{ &.{1}, &.{ 1, 1 }, &.{1} }));
++}
++
++test "a probe step failing on any one rank: every rank refuses, or every rank keeps NCCL, and none enters a gather unready" {
++    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
++    const Point = enum { none, prepare, wire, nccl, wait, equal };
++    const Run = struct {
++        port: u16,
++        lfd: tp.sock.Fd,
++        at: Point,
++        on: u32,
++        took: [6]std.atomic.Value(u32) = @splat(.init(0)),
++        errs: [3]?anyerror = .{ null, null, null },
++        entered: [3]bool = .{ false, false, false },
++
++        const R = @This();
++        const Rank = struct {
++            run: *R,
++            me: u32,
++
++            fn step(k: *Rank, p: Point) anyerror!void {
++                _ = k.run.took[@backingInt(p)].fetchAdd(1, .monotonic);
++                if (k.run.at == p and k.run.on == k.me) return error.Injected;
++            }
++            fn from(ctx: *anyopaque) *Rank {
++                return @ptrCast(@alignCast(ctx));
++            }
++            fn prepare(ctx: *anyopaque) anyerror!void {
++                return from(ctx).step(.prepare);
++            }
++            fn wire(ctx: *anyopaque) anyerror!void {
++                return from(ctx).step(.wire);
++            }
++            fn nccl(ctx: *anyopaque) anyerror!void {
++                return from(ctx).step(.nccl);
++            }
++            fn wait(ctx: *anyopaque) anyerror!void {
++                return from(ctx).step(.wait);
++            }
++            fn equal(ctx: *anyopaque) bool {
++                from(ctx).step(.equal) catch return false;
++                return true;
++            }
++        };
++
++        fn rank(run: *@This(), me: u32) void {
++            var b = (if (me == 0) tp.Bootstrap.acceptOn(run.lfd, 3, 5 * std.time.ns_per_s) else tp.Bootstrap.open(.{ .world = 3, .rank = me, .link_port = run.port, .connect_timeout_ns = 5 * std.time.ns_per_s })) catch |e| {
++                run.errs[me] = e;
++                return;
++            };
++            defer b.close();
++            var k: Rank = .{ .run = run, .me = me };
++            vote(&b, .{ .ctx = &k, .prepare = Rank.prepare, .wire = Rank.wire, .nccl = Rank.nccl, .wait = Rank.wait, .equal = Rank.equal }, &run.entered[me]) catch |e| {
++                run.errs[me] = e;
++            };
++        }
++    };
++    const Verdict = enum { lend, nccl, refuse };
++    for (std.enums.values(Point)) |at| for (0..3) |on| {
++        if (at == .none and on > 0) continue;
++        const l = try tp.bootstrap.testListener();
++        defer tp.sock.close(l.fd);
++        var run: Run = .{ .port = l.port, .lfd = l.fd, .at = at, .on = @intCast(on) };
++        var t: [2]std.Thread = undefined;
++        for (&t, 1..) |*x, me| x.* = try std.Thread.spawn(.{}, Run.rank, .{ &run, @as(u32, @intCast(me)) });
++        run.rank(0);
++        for (t) |x| x.join();
++        const want: Verdict = switch (at) {
++            .none => .lend,
++            .prepare, .wire, .equal => .nccl,
++            .nccl, .wait => .refuse,
++        };
++        for (run.errs, run.entered) |e, entered| {
++            const got: Verdict = if (e) |err| (if (fallsBack(err, entered)) .nccl else .refuse) else .lend;
++            try std.testing.expectEqual(want, got);
++        }
++        // unready anywhere: no rank entered a gather; past that, every rank entered NCCL's, the wire failing or not
++        const gathers: u32 = if (at == .prepare) 0 else 3;
++        try std.testing.expectEqual(gathers, run.took[@backingInt(Point.wire)].load(.monotonic));
++        try std.testing.expectEqual(gathers, run.took[@backingInt(Point.nccl)].load(.monotonic));
++    };
++}
+-- 
+2.43.0
+
