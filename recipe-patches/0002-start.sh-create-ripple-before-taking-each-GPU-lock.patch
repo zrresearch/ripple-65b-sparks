@@ -1,0 +1,35 @@
+From a47e3f0fef4e877b1339996185699320c1b831e2 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:35:28 +0000
+Subject: [PATCH] start.sh: create ~/ripple before taking each GPU lock (a
+ fresh worker read as busy)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/start.sh | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/start.sh b/scripts/start.sh
+index 3fe3dea..2def78e 100755
+--- a/scripts/start.sh
++++ b/scripts/start.sh
+@@ -21,6 +21,7 @@ TAG="serve $NAME :$PORT $(date -Is)"
+ [[ -f $MODEL_DIR/config.json ]] || die "no pack at $MODEL_DIR"
+ for W in "${W_LIST[@]}"; do ssh -n "$W" "test -f $MODEL_DIR/config.json" || die "$W has no pack at $MODEL_DIR"; done
+ ss -ltn "( sport = :$PORT )" | grep -q LISTEN && die "port $PORT is taken"
++mkdir -p "$(dirname "$LOCK")"
+ ( set -o noclobber; echo "$TAG" > "$LOCK" ) 2> /dev/null || die "head GPU busy: $(cat "$LOCK")"
+ LOCKED=()
+ fail() {
+@@ -29,7 +30,7 @@ fail() {
+   rm -f "$LOCK"; die "$@"
+ }
+ for W in "${W_LIST[@]}"; do
+-  ssh -n "$W" "( set -o noclobber; echo '$TAG' > ~/ripple/gpu.lock ) 2> /dev/null" || fail "$W GPU busy: $(ssh -n "$W" cat ~/ripple/gpu.lock)"
++  ssh -n "$W" "mkdir -p ~/ripple; ( set -o noclobber; echo '$TAG' > ~/ripple/gpu.lock ) 2> /dev/null" || fail "$W GPU busy: $(ssh -n "$W" cat ~/ripple/gpu.lock)"
+   LOCKED+=("$W")
+ done
+ # the same build on every node
+-- 
+2.43.0
+

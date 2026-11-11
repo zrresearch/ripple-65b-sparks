@@ -1,0 +1,43 @@
+== plain: start 22:26:23
+[22:27:28] up after 60 s
+[22:27:28] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 26.88 GiB; 1 stream at once, 16.07 GiB each at a 1048576-token window, of 79.2 GiB left after a 4.0 GiB reserve; prompts in passes of up to 128 rows, a 16.0 GiB prompt cache; own glue kernels
+[22:27:29] MemAvailable GiB: head 83.2, rank1 88.3, rank2 88.2, rank3 88.2
+[22:27:29] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[22:27:29] serving Ripple-65B-Preview at http://head:8888/v1 on 4 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding 17.65 tok/s [487, 487]
+agent tool call 19.09 tok/s [512, 512]
+chat 17.43 tok/s [472, 472]
+coding: identical (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[22:31:25] stopped
+== drafted: start 22:31:25
+[22:31:52] up after 25 s
+[22:31:52] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 29.13 GiB; 1 stream at once, 16.15 GiB each at a 1048576-token window, of 76.5 GiB left after a 4.0 GiB reserve; prompts in passes of up to 128 rows, a 16.0 GiB prompt cache; own glue kernels
+[22:31:53] MemAvailable GiB: head 80.3, rank1 85.6, rank2 85.7, rank3 85.6
+[22:31:54] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[22:31:54] serving Ripple-65B-Preview at http://head:8888/v1 on 4 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding 55.7 tok/s [487, 487]
+agent tool call 50.47 tok/s [512, 512]
+chat 25.55 tok/s [472, 472]
+coding: identical (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[22:33:52] stopped
+== streams4: start 22:33:52
+[22:34:14] up after 20 s
+[22:34:14] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 29.15 GiB; 4 streams at once, 4.15 GiB each at a 262144-token window, of 76.5 GiB left after a 4.0 GiB reserve; prompts in passes of up to 128 rows, a 16.0 GiB prompt cache; own glue kernels
+[22:34:15] MemAvailable GiB: head 80.2, rank1 85.9, rank2 85.7, rank3 85.8
+[22:34:16] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[22:34:16] serving Ripple-65B-Preview at http://head:8888/v1 on 4 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding: identical (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[22:34:50] stopped
+== done 22:34:50

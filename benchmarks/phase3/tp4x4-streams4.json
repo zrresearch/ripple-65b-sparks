@@ -1,0 +1,66 @@
+{
+ "coding": {
+  "content": "```python\nimport re\nfrom datetime import timedelta\n\n\ndef parse_iso8601_duration(value: str) -> timedelta:\n    \"\"\"Parse an ISO 8601 duration string into a datetime.timedelta.\n\n    Only day, hour, minute and second components are supported. Durations\n    containing years or months raise ValueError, since those units cannot be\n    represented exactly as a fixed timedelta.\n\n    Args:\n        value: An ISO 8601 duration string, e.g. \"P3DT4H12M5S\".\n\n    Returns:\n        A datetime.timedelta representing the duration.\n\n    Raises:\n        ValueError: If the string is malformed or contains years or months.\n    \"\"\"\n    if not isinstance(value, str):\n        raise ValueError(\"duration must be a string\")\n\n    match = re.fullmatch(\n        r\"P(?:(?P<days>\\d+)D)?\"\n        r\"(?:(?P<hours>\\d+)H)?\"\n        r\"(?:(?P<minutes>\\d+)M)?\"\n        r\"(?:(?P<seconds>\\d+(?:\\.\\d+)?)S)?\",\n        value,\n    )\n    if match is None or not any(match.groupdict().values()):\n        raise ValueError(f\"invalid ISO 8601 duration: {value!r}\")\n\n    parts = match.groupdict()\n    if \"Y\" in value or \"M\" in value.replace(parts[\"minutes\"] or \"\", \"\"):\n        # A bare 'M' that is not the minutes component means months.\n        raise ValueError(\"years and months are not supported\")\n\n    return timedelta(\n        days=int(parts[\"days\"] or 0),\n        hours=int(parts[\"hours\"] or 0),\n        minutes=int(parts[\"minutes\"] or 0),\n        seconds=float(parts[\"seconds\"] or 0),\n    )\n```\n\nThe regex accepts the standard `PnDTnHnMn",
+  "reasoning": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 53,
+   "completion_tokens": 384,
+   "total_tokens": 437,
+   "prompt_tokens_details": {
+    "cached_tokens": 3
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  }
+ },
+ "agent": {
+  "content": "{\"cmd\": \"find /var/log -type f -printf '%s %p\\\\n' | sort -rn | head -5\"}",
+  "reasoning": null,
+  "finish": "stop",
+  "usage": {
+   "prompt_tokens": 46,
+   "completion_tokens": 30,
+   "total_tokens": 76,
+   "prompt_tokens_details": {
+    "cached_tokens": 3
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  }
+ },
+ "chat": {
+  "content": "Day 1: Arrive in West Glacier, stop at the Apgar Visitor Center, and walk the relatively flat Trail of the Cedars and Avalanche Lake loop. Day 2: Drive Going-to-the-Sun Road as far as conditions allow, with short stops at Logan Pass and Hidden Lake Overlook. Day 3: Hike the Grinnell Glacier area or the Iceberg Lake trail, depending on snow and road access. Day 4: Explore the Many Glacier area with a moderate hike such as Swiftcurrent Lake and Grinnell Point, then depart. Check road status and weather before each day, since autumn closures and early snow are common.",
+  "reasoning": null,
+  "finish": "stop",
+  "usage": {
+   "prompt_tokens": 28,
+   "completion_tokens": 135,
+   "total_tokens": 163,
+   "prompt_tokens_details": {
+    "cached_tokens": 3
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  }
+ },
+ "long": {
+  "content": "",
+  "reasoning": "We need answer. Need parse. User asks: \"Which sensor had the highest reading at minute 397, and what was it? Then list the readings of sensor 3 between minutes 300 and 400.\"\n\nWe need inspect data. At minute 397: Record 397: sensor 6 read 84.3 degrees at minute 397. Need highest reading at minute 397? There is only one record at minute 397? The records are sequential minute 0-399, one sensor per minute. So at minute 397, sensor 6 read 84.3. \"Which sensor had the highest reading at minute 397\" likely among all records at minute 397? Only sensor 6. So sensor 6, 84.3 degrees. But maybe they mean highest reading at minute 397 among sensors? Since each minute one sensor reading, yes.\n\nThen list readings of sensor 3 between minutes 300 and 400. Need identify records where sensor 3 and minute between 300 and 400 inclusive? \"between minutes 300 and 400\" likely inclusive? Need list readings of sensor 3 from minute 300 to 400. Let's extract.\n\nData pattern: sensors cycle 0-16 every 17 minutes. Minute m sensor = m mod 17? Let's verify: minute 0 sensor0, 1 sensor1, ..., 16 sensor16, 17 sensor0. Yes sensor = minute mod 17. Sensor 3 occurs at minutes m \u2261 3 mod 17. Between 300 and 400 inclusive. Need list readings for sensor 3 at those minutes.\n\nLet's compute. Minutes 300-400 inclusive. Sensor 3 when m mod 17 = 3. Need find m.\n\n17*17=289. 300 mod17? 17*17=289 remainder 11. So",
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 7240,
+   "completion_tokens": 384,
+   "total_tokens": 7624,
+   "prompt_tokens_details": {
+    "cached_tokens": 3
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  }
+ }
+}

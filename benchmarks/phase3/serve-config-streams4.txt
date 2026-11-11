@@ -1,0 +1,6 @@
+# 2026-11-11T22:33:59+00:00 scripts/start.sh
+pack ~/models/Ripple-65B-Preview-exl3-5.0bpw-ajensenwaud
+build ~/ripple/tensorfold/zig-out 9ed77023a0bb3ecb 139167c36e14186f 
+world 4: head rank1 rank2 rank3
+rank0 --gpus all --ipc=host --network host --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 --user 1000:1000 -e HOME=/tmp -v ~/models/Ripple-65B-Preview-exl3-5.0bpw-ajensenwaud:~/models/Ripple-65B-Preview-exl3-5.0bpw-ajensenwaud:ro -v ~/ripple/tensorfold:~/ripple/tensorfold:ro -e NCCL_COMM_ID=<fabric-ip>:29681 -e NCCL_SOCKET_IFNAME=<netdev> -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=5 -e TF_ROCE_GID_INDEX=5 -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e TF_RICURSIVE_RANK=0 -e TF_RICURSIVE_WORLD=4 -e TF_RICURSIVE_CONTEXT=262144 -e TF_RICURSIVE_SLOTS=4 -e TF_RICURSIVE_GRAPHS=1 -e TF_RICURSIVE_ROCE=1 -e TENSORFOLD_MEMORY_RESERVE_GIB=4 -e TF_TP_MASTER=<fabric-ip> -e TF_TP_PORT=29700 -e TF_TP_KERNEL_IMAGE=~/ripple/tensorfold/zig-out/lib/tp_mailbox.fatbin 
+serve --parallel 4 --context 262144 --max-tokens 32768  --drafter ~/models/Ripple-65B-Preview-DFlash2 
