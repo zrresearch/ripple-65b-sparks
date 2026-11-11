@@ -148,7 +148,7 @@ footer { font-family: var(--f-sans); font-size: 13px; color: var(--ink-2); }
 
 <p>Ricursive's <a href="https://huggingface.co/ricursiveAI/Ripple-65B-Preview">Ripple-65B Preview</a> is a 65-billion-parameter dense transformer with a 1M-token context, released on November 4 under Apache-2.0. Its card reports 80.5 on Terminal-Bench 2.1, level with open models ten times its size. Unlike the mixture-of-experts models we usually serve, it reads every weight for every token, and on a DGX Spark, where decode is limited by memory bandwidth, that makes it slow: about 4 to 5 tokens per second on one GB10.</p>
 <p>Spreading the model over more Sparks divides the weights each one reads per token. Within a week of release, community work in <a href="https://github.com/ashhart/TensorFold">TensorFold</a> served Ripple on one GB10 and on two, the second with the full 1M context, but no serving stack runs it on four. We want to build that: a recipe that serves Ripple across four Sparks on a QSFP switch, with the full context, sixteen concurrent streams and the publisher's speculative-decoding draft model, measured the way we measured apex-flash-1.</p>
-<p>This page records the work as it happens. It starts with what already exists and our plan; results replace the plan as they come in. Phase 1, reproducing the two-Spark recipe, is nearly done.</p>
+<p>This page records the work as it happens. It starts with what already exists and our plan; results replace the plan as they come in. Phase 1, reproducing the two-Spark recipe, is done.</p>
 
 <nav class="toc" aria-label="Contents">
   <p>Contents</p>
@@ -227,7 +227,7 @@ footer { font-family: var(--f-sans); font-size: 13px; color: var(--ink-2); }
   </table>
 </div>
 <p>The reference pack reproduces the published perplexity to three decimals. Our pack is slightly but consistently further from BF16: 0.25% higher perplexity, and a mean KL divergence about a third higher, in every band of the reference model's confidence but the most certain. Both packs came from the same quantizer commit, settings and source weights, so the likeliest cause is variation between conversion runs. A second conversion would measure that spread; until then we continue from the reference pack, which is the better of the two.</p>
-<p>Still to reproduce in this phase is the long context: a prompt of about 1M tokens, which reads in roughly 1.8 hours at the published rate.</p>
+<p>The long context reproduces as well. We built a 1,015,070-token prompt from WikiText-2 articles, hid one sentence giving an access code 60% of the way in, and asked for the code at the end. The two Sparks read the prompt at 156.6 tokens per second, in 1 hour 48 minutes, against the published 156; the model returned the exact code and then decoded at 5.2 tokens per second with the draft model on. The two-Spark recipe does what it reports, and Phase 2 starts from it with the reference pack.</p>
 
 <h2 id="appendix">Appendix: sources and versions</h2>
 <div class="tbl">

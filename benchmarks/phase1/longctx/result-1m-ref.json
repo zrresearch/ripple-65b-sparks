@@ -1,0 +1,21 @@
+{
+ "prompt_tokens": 1015070,
+ "first_token_s": 6483.9,
+ "prompt_tok_s": 156.6,
+ "completion_tokens": 65,
+ "decode_tok_s": 5.22,
+ "answer": "7319-KESTREL-0442",
+ "reasoning_tail": "We need answer. Need find sentence giving access code for Larchmont archive. In text: \"The access code for the Larchmont archive is 7319-KESTREL-0442.\" Need reply code only. Ensure exact.",
+ "found": true,
+ "usage": {
+  "prompt_tokens": 1015070,
+  "completion_tokens": 65,
+  "total_tokens": 1015135,
+  "prompt_tokens_details": {
+   "cached_tokens": 3
+  },
+  "completion_tokens_details": {
+   "reasoning_tokens": 0
+  }
+ }
+}
