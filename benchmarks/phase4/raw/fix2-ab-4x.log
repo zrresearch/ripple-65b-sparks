@@ -1,0 +1,29 @@
+[05:55:46] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+[zig-out-pfd512 default] goldens vs phase 3:
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[zig-out-pfd512 default] 7651 tokens: 1000 / 997 tok/s
+[zig-out-pfd512 default] 30050 tokens: 966 / 965 tok/s
+[zig-out-pfd512 default] code decode 1 stream: 62.0 / 60.4 tok/s (incl. prompt)
+[05:58:14] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+[zig-out-pfd512 -e TF_RICURSIVE_PFD=0] goldens vs phase 3:
+coding: identical (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[zig-out-pfd512 -e TF_RICURSIVE_PFD=0] 7647 tokens: 680 / 679 tok/s
+[zig-out-pfd512 -e TF_RICURSIVE_PFD=0] 30050 tokens: 664 / 664 tok/s
+[zig-out-pfd512 -e TF_RICURSIVE_PFD=0] code decode 1 stream: 62.4 / 61.0 tok/s (incl. prompt)
+[06:01:21] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+[zig-out-0011 default] goldens vs phase 3:
+coding: identical (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[zig-out-0011 default] 7652 tokens: 641 / 640 tok/s
+[zig-out-0011 default] 30049 tokens: 610 / 610 tok/s
+[zig-out-0011 default] code decode 1 stream: 64.2 / 61.9 tok/s (incl. prompt)
+[06:04:13] stopped
+AB2 DONE

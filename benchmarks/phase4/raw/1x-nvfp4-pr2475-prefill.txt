@@ -1,0 +1,37 @@
+completed None
+{
+ "kind": "prefill",
+ "sizes": [
+  {
+   "contextTokens": 4113,
+   "prefillTokS": 494.2279942279942,
+   "ttftMs": 8316
+  },
+  {
+   "contextTokens": 8207,
+   "prefillTokS": 496.79060191352795,
+   "ttftMs": 16514
+  },
+  {
+   "contextTokens": 16398,
+   "prefillTokS": 490.6625965164302,
+   "ttftMs": 33414
+  },
+  {
+   "contextTokens": 32780,
+   "prefillTokS": 472.91798926530845,
+   "ttftMs": 69308
+  },
+  {
+   "contextTokens": 65551,
+   "prefillTokS": 432.7771872255858,
+   "ttftMs": 151459
+  },
+  {
+   "contextTokens": 122892,
+   "prefillTokS": 373.8443706896814,
+   "ttftMs": 328717
+  }
+ ],
+ "skipped": []
+}

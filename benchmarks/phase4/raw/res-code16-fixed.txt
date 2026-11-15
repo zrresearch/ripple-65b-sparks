@@ -1,0 +1,22 @@
+completed None
+{
+ "kind": "decode",
+ "levels": [
+  {
+   "concurrency": 16,
+   "aggregateTokS": 221.10647378165498,
+   "perStreamTokS": 17.225272050931796,
+   "ttftP50Ms": 3669.5,
+   "completionTokens": 7046,
+   "durationMs": 32165
+  },
+  {
+   "concurrency": 16,
+   "aggregateTokS": 238.37878070234794,
+   "perStreamTokS": 17.491125028176793,
+   "ttftP50Ms": 1246.5,
+   "completionTokens": 7046,
+   "durationMs": 29706
+  }
+ ]
+}

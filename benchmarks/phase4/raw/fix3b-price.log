@@ -1,0 +1,17 @@
+[old] serving
+[old prose] 16 at once:  143.4 tok/s aggregate,   9.5 per request, TTFT 4227 ms
+   drafted 1.81 per stream-round, accepted 40.7%, tokens per stream-round 1.74
+[old prose] 8 at once:  103.2 tok/s aggregate,  13.8 per request, TTFT 1476 ms
+   drafted 1.72 per stream-round, accepted 42.0%, tokens per stream-round 1.73
+[old] code decode (bench-mwgmqxkq-3662): 1: 67.3 / 2: 97.5 / 4: 151.4 / 8: 201.0 / 16: 228.9
+[fixed] serving
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[fixed prose] 16 at once:  190.3 tok/s aggregate,  12.0 per request, TTFT 4100 ms
+   drafted 0.08 per stream-round, accepted 45.4%, tokens per stream-round 1.04
+[fixed prose] 8 at once:  112.0 tok/s aggregate,  14.4 per request, TTFT 1476 ms
+   drafted 0.43 per stream-round, accepted 41.0%, tokens per stream-round 1.18
+[fixed] code decode (bench-mwgn57bj-e8b8): 1: 65.2 / 2: 107.7 / 4: 153.6 / 8: 200.3 / 16: 217.2
+PRICE DONE

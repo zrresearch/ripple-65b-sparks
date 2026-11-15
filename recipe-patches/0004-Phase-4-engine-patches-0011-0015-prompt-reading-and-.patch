@@ -1,0 +1,1067 @@
+From e5744e63b98be3d64790668da4cd7b99c639edd2 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:19:48 +0000
+Subject: [PATCH 4/4] Phase 4 engine patches 0011-0015: prompt reading and
+ multi-stream decode
+
+- 0011 row reduce-scatter for prompt partials at three ranks or more (same bits)
+- 0012 prompt projections by pfdense, prompt chunks of 1,024 rows
+- 0013 prompt layer tails in two halves, each half's exchange overlapped with the other's compute (same bits)
+- 0014 shared rounds of 64 rows, one drafter pass a round (timed and priced), batched absorbs
+- 0015 shared rounds price the drafter's pass by the streams that draft
+ZIG_TREE moves to the patched tree de18a25b.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ...-rows-partials-at-three-ranks-or-mor.patch | 148 +++++++
+ ...-projections-by-pfdense-prompt-chunk.patch | 266 +++++++++++++
+ ...-calls-layer-tails-in-two-halves-eac.patch | 162 ++++++++
+ ...-rounds-of-64-rows-one-drafter-pass-.patch | 363 ++++++++++++++++++
+ ...nds-price-a-timed-drafter-pass-by-th.patch |  54 +++
+ scripts/config.sh                             |   2 +-
+ 6 files changed, 994 insertions(+), 1 deletion(-)
+ create mode 100644 patches-zig/0011-ricursive-prompt-rows-partials-at-three-ranks-or-mor.patch
+ create mode 100644 patches-zig/0012-ricursive-prompt-projections-by-pfdense-prompt-chunk.patch
+ create mode 100644 patches-zig/0013-ricursive-prompt-calls-layer-tails-in-two-halves-eac.patch
+ create mode 100644 patches-zig/0014-ricursive-shared-rounds-of-64-rows-one-drafter-pass-.patch
+ create mode 100644 patches-zig/0015-lanes-shared-rounds-price-a-timed-drafter-pass-by-th.patch
+
+diff --git a/patches-zig/0011-ricursive-prompt-rows-partials-at-three-ranks-or-mor.patch b/patches-zig/0011-ricursive-prompt-rows-partials-at-three-ranks-or-mor.patch
+new file mode 100644
+index 0000000..cdb778c
+--- /dev/null
++++ b/patches-zig/0011-ricursive-prompt-rows-partials-at-three-ranks-or-mor.patch
+@@ -0,0 +1,148 @@
++From 95fe7632f005ccec2384f2ba7a367e47d6ffcf86 Mon Sep 17 00:00:00 2001
++From: operator <225459632+operator@users.noreply.github.com>
++Date: Sat, 14 Nov 2026 05:34:33 +0000
++Subject: [PATCH 11/15] ricursive: prompt rows' partials at three ranks or more
++ by a row reduce-scatter (same bits, half the bytes)
++
++At four ranks each o_proj and down_proj gathered every rank's whole fp32 partial (three times a rank's share of
++bytes in, per exchange). cuda.rank_scatter sends each rank only its share of the rows, sums them in rank order with
++tf_rank_sum (the adds and order of tf_ripple_rank_sum), and the summed shares go to every rank in one send/recv group:
++half the bytes, the same bits. Prompt calls (more than 16 rows) at three ranks or more; TF_RICURSIVE_SCATTER=0 keeps
++the gather. Four GB10s: cold prefill 557-571 -> 643 tok/s at 7.6K tokens, 534-542 -> 610 at 30K; greedy replies
++byte-identical to the four-rank goldens (code, tool call, chat, a 7,240-token lookup; DFlash2 on).
++---
++ zig/src/families/ricursive/cuda_forward.zig | 16 ++++++-
++ zig/src/families/ricursive/cuda_scatter.zig | 52 +++++++++++++++++++++
++ 2 files changed, 66 insertions(+), 2 deletions(-)
++ create mode 100644 zig/src/families/ricursive/cuda_scatter.zig
++
++diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
++index 82f56f0cf..f91d7f94f 100644
++--- a/zig/src/families/ricursive/cuda_forward.zig
+++++ b/zig/src/families/ricursive/cuda_forward.zig
++@@ -7,6 +7,7 @@ const config = @import("config.zig");
++ const weights = @import("cuda_weights.zig");
++ const Kernels = @import("cuda_kernels.zig").Kernels;
++ const kept = @import("cuda_kept.zig");
+++const Scatter = @import("cuda_scatter.zig").Scatter;
++ 
++ const hd = config.head_dim;
++ const Tree = cuda.tree_attention.TreeAttention;
++@@ -112,6 +113,7 @@ pub const Model = struct {
++     tree: Tree,
++     k: Kernels,
++     group: ?cuda.tp_group.Group = null,
+++    scatter: ?Scatter = null, // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
++     caches: []Cache = &.{},
++     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++     // a rank's heads, key heads, FFN width and vocab share
++@@ -156,6 +158,8 @@ pub const Model = struct {
++             m.group = try cuda.tp_group.Group.open(d, o.place.rank, world);
++             if (o.roce and world == 2) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
++             if (o.roce and world > 2) try roce_multi.open(gpa, io, d, &m.group.?, true);
+++            const off = if (std.c.getenv("TF_RICURSIVE_SCATTER")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+++            if (world > 2 and !off) m.scatter = try Scatter.init(d, max_rows, world, c.hidden);
++         }
++         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
++         m.dense = try cuda.exl3.Dense.load(d);
++@@ -281,6 +285,7 @@ pub const Model = struct {
++         m.norms.unload();
++         m.dense.unload();
++         m.w.deinit();
+++        if (m.scatter) |*x| x.deinit();
++         if (m.group) |*g| g.close();
++         m.stream.deinit();
++         m.gpa.destroy(m);
++@@ -424,6 +429,13 @@ pub const Model = struct {
++         }
++     }
++ 
+++    /// n rows of o_proj or down_proj partials (parts + rank * n rows) summed over the ranks into `into`.
+++    fn sumParts(m: *Model, into: u64, n: usize) !void {
+++        const h = m.c.hidden;
+++        if (m.scatter) |*x| if (n > tree_rows) return x.sum(&m.group.?, m.stream, m.b.parts + m.rank() * n * h * 4, n, h, into);
+++        try m.sumRanks(into, n * h * 4);
+++    }
+++
++     /// `bytes` a rank at parts + rank * bytes gathered from every rank, then summed in rank order into `into`.
++     pub fn sumRanks(m: *Model, into: u64, bytes: usize) !void {
++         const g = &m.group.?;
++@@ -563,7 +575,7 @@ pub const Model = struct {
++             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
++             if (world == 1) try m.dense.prompt(s, l.o, b.gated, .f16, n, b.a, .f32) else {
++                 try m.dense.prompt(s, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++-                try m.sumRanks(b.a, n * h * 4);
+++                try m.sumParts(b.a, n);
++             }
++             try m.k.normAdd(s, b.a, l.post_attn, b.x, n, h, c.eps);
++             try m.norms.rms(s, b.x, .f32, l.pre_ffn, b.y, .f16, n, h, c.eps);
++@@ -573,7 +585,7 @@ pub const Model = struct {
++             try m.k.swiglu(s, b.gu, gu_up, b.act, n * m.ff, c.clamp);
++             if (world == 1) try m.dense.prompt(s, l.down, b.act, .f16, n, b.a, .f32) else {
++                 try m.dense.prompt(s, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++-                try m.sumRanks(b.a, n * h * 4);
+++                try m.sumParts(b.a, n);
++             }
++             try m.k.normAdd(s, b.a, l.post_ffn, b.x, n, h, c.eps);
++             if (m.tapk) |*tk| for (m.taps[0..m.n_taps], 0..) |t, ti| if (t == li) try tk.taps(s, b.x, pos, slots, m.tap_ring, tap_rows, m.n_taps, ti, h, n);
++diff --git a/zig/src/families/ricursive/cuda_scatter.zig b/zig/src/families/ricursive/cuda_scatter.zig
++new file mode 100644
++index 000000000..d454f1500
++--- /dev/null
+++++ b/zig/src/families/ricursive/cuda_scatter.zig
++@@ -0,0 +1,52 @@
+++//! Prompt rows' o_proj and down_proj partials at three ranks or more: a reduce-scatter by rows in rank order (each rank
+++//! adds its share of the rows from every rank, tf_rank_sum: the same adds in the same order as tf_ripple_rank_sum), then
+++//! each rank sends its summed rows to every other. A rank receives half the bytes of gathering every whole partial, and
+++//! the sums keep their bits. TF_RICURSIVE_SCATTER=0 keeps the gather.
+++const std = @import("std");
+++const cuda = @import("cuda");
+++
+++const share = cuda.rank_scatter.share;
+++
+++pub const Scatter = struct {
+++    rs: cuda.rank_scatter.RankScatter,
+++    scratch: cuda.DeviceBuffer,
+++
+++    /// Up to `rows` rows of `width` fp32 values a call, at `world` ranks.
+++    pub fn init(d: *const cuda.Driver, rows: usize, world: usize, width: usize) !Scatter {
+++        var rs = try cuda.rank_scatter.RankScatter.load(d);
+++        errdefer rs.unload();
+++        return .{ .rs = rs, .scratch = try cuda.DeviceBuffer.alloc(d, cuda.rank_scatter.scratchBytes(rows, world, width)) };
+++    }
+++
+++    pub fn deinit(x: *Scatter) void {
+++        x.scratch.free();
+++        x.rs.unload();
+++    }
+++
+++    /// Every rank's `partial` [rows][width] fp32 summed in rank order into `into` [rows][width], on `s`.
+++    pub fn sum(x: *const Scatter, g: *const cuda.tp_group.Group, s: cuda.Stream, partial: u64, rows: usize, width: usize, into: u64) !void {
+++        const mine = share(rows, g.world, g.rank);
+++        try x.rs.run(&g.lib, g.comm, g.world, g.rank, s, partial, rows, width, x.scratch.ptr, into + mine[0] * width * 4);
+++        try g.lib.group(Spread{ .g = g, .s = s, .into = into, .rows = rows, .width = width }, Spread.post);
+++    }
+++
+++    /// The summed shares to every rank: one send/recv group, each share straight into its rows of `into`.
+++    const Spread = struct {
+++        g: *const cuda.tp_group.Group,
+++        s: cuda.Stream,
+++        into: u64,
+++        rows: usize,
+++        width: usize,
+++
+++        fn post(t: Spread) anyerror!void {
+++            const mine = share(t.rows, t.g.world, t.g.rank);
+++            const row = t.width * 4;
+++            for (0..t.g.world) |peer| {
+++                if (peer == t.g.rank) continue;
+++                const theirs = share(t.rows, t.g.world, peer);
+++                if (mine[1] > mine[0]) try t.g.send(t.s, t.into + mine[0] * row, (mine[1] - mine[0]) * row, peer);
+++                if (theirs[1] > theirs[0]) try t.g.recv(t.s, t.into + theirs[0] * row, (theirs[1] - theirs[0]) * row, peer);
+++            }
+++        }
+++    };
+++};
++-- 
++2.43.0
++
+diff --git a/patches-zig/0012-ricursive-prompt-projections-by-pfdense-prompt-chunk.patch b/patches-zig/0012-ricursive-prompt-projections-by-pfdense-prompt-chunk.patch
+new file mode 100644
+index 0000000..5ae1155
+--- /dev/null
++++ b/patches-zig/0012-ricursive-prompt-projections-by-pfdense-prompt-chunk.patch
+@@ -0,0 +1,266 @@
++From 5e50da050ae3b0c5ec1998a150b9199fc5d37119 Mon Sep 17 00:00:00 2001
++From: operator <225459632+operator@users.noreply.github.com>
++Date: Sat, 14 Nov 2026 06:11:43 +0000
++Subject: [PATCH 12/15] ricursive: prompt projections by pfdense, prompt chunks
++ of 1,024 rows
++
++Prompt rows ran the EXL3 trellis kernel in 128-row blocks, decoding every rank's weights again each block (~30 TFLOPS
++on a GB10 at any chunk). pfdense (exl3_block/pfdense.cuh, DeepSeek-V4.1's fused prefill GEMM; built here for K2 10,
++the stored layout, as ricursive_pfd) decodes the trellis inside a tensor-core GEMM after exl3's rot_in: 39 TFLOPS on
++Ripple's four-rank shapes at 128 rows, 61-68 from 512. Prompt chunks grow to 1,024 rows (max_rows; the tap ring keeps a
++chunk plus 128). Decode rows keep the trellis kernel. TF_RICURSIVE_PFD=0 keeps it for prompts too (then every greedy
++golden is byte-identical to the four-rank build, and 16K WikiText-2 NLL bit-identical to 128-row chunks).
++
++pfdense does not add in the trellis kernel's order: on 16,384 WikiText-2 test tokens, one GB10, perplexity 6.9793 ->
++6.9802 (+0.013%), top-1 agreement 99.66%. Four GB10s with patch 0011: cold prefill 641 -> 1,051 tok/s at 7.6K tokens,
++610 -> 1,015 at 30K.
++---
++ zig/build/cuda_kernels.zig                  |  1 +
++ zig/kernels/cuda/ricursive_pfd.cu           |  6 ++
++ zig/src/cuda/kernels.zig                    |  1 +
++ zig/src/families/ricursive/cuda_forward.zig | 35 +++++---
++ zig/src/families/ricursive/cuda_pfd.zig     | 90 +++++++++++++++++++++
++ 5 files changed, 121 insertions(+), 12 deletions(-)
++ create mode 100644 zig/kernels/cuda/ricursive_pfd.cu
++ create mode 100644 zig/src/families/ricursive/cuda_pfd.zig
++
++diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
++index bd25d7162..f85bd89a4 100644
++--- a/zig/build/cuda_kernels.zig
+++++ b/zig/build/cuda_kernels.zig
++@@ -113,6 +113,7 @@ pub const kernels = [_]Kernel{
++     .{ .name = "moss_image", .flags = glue }, // ours: MOSS-Image's modulated norm, q/k rotary, situ, gated add
++     .{ .name = "ricursive", .flags = glue }, // ours: Ripple's embed scale, value residual, gate, clamped SwiGLU, post-norms
++     .{ .name = "ricursive_draft", .flags = &.{"-O3"} }, // ours: Ripple's DFlash2 drafter glue (taps, convolutions, attention)
+++    .{ .name = "ricursive_pfd", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Ripple's prompt projections by pfdense (exl3_block)
++     .{ .name = "tree_round", .flags = &.{"-O3"} }, // ours: verified tree rounds for every family (cuda/tree_round.zig)
++     .{ .name = "act_rows", .flags = &.{"-O3"} }, // ours: SwiGLU, output gates, group sums (cuda/act_rows.zig)
++     .{ .name = "gdn_prep", .flags = &.{"-O3"} }, // ours: Gated DeltaNet conv, norms, g and beta (cuda/gdn_prep.zig)
++diff --git a/zig/kernels/cuda/ricursive_pfd.cu b/zig/kernels/cuda/ricursive_pfd.cu
++new file mode 100644
++index 000000000..23288df6b
++--- /dev/null
+++++ b/zig/kernels/cuda/ricursive_pfd.cu
++@@ -0,0 +1,6 @@
+++// ours: Ripple's prompt projections by pfdense (exl3_block/pfdense.cuh, DeepSeek-V4.1's fused prefill GEMM) at K2 = 10
+++// (the 5.0 bpw packs, mul1), the stored trellis layout: pfdense_args.h configurations 0 and 5 (cuda_pfd.zig).
+++#include "exl3_block/pfdense.cuh"
+++
+++template __global__ void dsv41_pfd::pfd_kernel<10, false, dsv41_pfd::Cfg<128, 2, 4, 2, 3>>(const dsv41_pfd::Args);
+++template __global__ void dsv41_pfd::pfd_kernel<10, false, dsv41_pfd::Cfg<128, 2, 4, 2, 2>>(const dsv41_pfd::Args);
++diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
++index dd7dfd6fe..edfa06904 100644
++--- a/zig/src/cuda/kernels.zig
+++++ b/zig/src/cuda/kernels.zig
++@@ -40,6 +40,7 @@ pub const vit: []const u8 = if (available) &Blob("fatbin_vit").bytes else &.{};
++ pub const moss_image: []const u8 = if (available) &Blob("fatbin_moss_image").bytes else &.{};
++ pub const ricursive: []const u8 = if (available) &Blob("fatbin_ricursive").bytes else &.{};
++ pub const ricursive_draft: []const u8 = if (available) &Blob("fatbin_ricursive_draft").bytes else &.{};
+++pub const ricursive_pfd: []const u8 = if (available) &Blob("fatbin_ricursive_pfd").bytes else &.{};
++ pub const scan_rows: []const u8 = if (available) &Blob("fatbin_scan_rows").bytes else &.{};
++ pub const nemotron_ops: []const u8 = if (available) &Blob("fatbin_nemotron_ops").bytes else &.{};
++ pub const lane_gemv: []const u8 = if (available) &Blob("fatbin_lane_gemv").bytes else &.{};
++diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
++index f91d7f94f..4a8f36364 100644
++--- a/zig/src/families/ricursive/cuda_forward.zig
+++++ b/zig/src/families/ricursive/cuda_forward.zig
++@@ -8,18 +8,19 @@ const weights = @import("cuda_weights.zig");
++ const Kernels = @import("cuda_kernels.zig").Kernels;
++ const kept = @import("cuda_kept.zig");
++ const Scatter = @import("cuda_scatter.zig").Scatter;
+++const Pfd = @import("cuda_pfd.zig").Pfd;
++ 
++ const hd = config.head_dim;
++ const Tree = cuda.tree_attention.TreeAttention;
++ const max_depth = cuda.tree_attention.max_depth;
++ /// Rows a forward call runs at once: the EXL3 linears' widest call, and tree attention's longest path.
++-pub const max_rows = 128;
+++pub const max_rows = 1024;
++ /// Rows a tree attention call takes when prompt chunks go to the prompt rows (decode rows only; sizes its scratch).
++ pub const tree_rows = 16;
++ /// Streams one decode call holds (each its own slot's rows).
++ pub const max_streams = 16;
++ /// Tap rows a slot's ring holds for a drafter (a prompt chunk and a window, read right after the call that wrote them).
++-pub const tap_rows = 256;
+++pub const tap_rows = max_rows + 128;
++ /// Query heads a key head in the padded prompt layout (head dim 128 prompt rows take 4 or 8 a block).
++ const pad_group = 12;
++ 
++@@ -113,6 +114,7 @@ pub const Model = struct {
++     tree: Tree,
++     k: Kernels,
++     group: ?cuda.tp_group.Group = null,
+++    pfd: ?Pfd = null, // prompt rows' projections by pfdense (cuda_pfd.zig); null: the trellis kernel
++     scatter: ?Scatter = null, // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
++     caches: []Cache = &.{},
++     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++@@ -163,6 +165,8 @@ pub const Model = struct {
++         }
++         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
++         m.dense = try cuda.exl3.Dense.load(d);
+++        const no_pfd = if (std.c.getenv("TF_RICURSIVE_PFD")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+++        if (!no_pfd) m.pfd = try Pfd.load(d, max_rows, @max(c.hidden, @max(m.hq * hd, m.ff)));
++         m.norms = try cuda.norms.Norms.load(d);
++         m.qk = try cuda.qk_rows.QkRows.load(d);
++         m.attn = try cuda.window_attention.WindowAttention.load(d);
++@@ -286,6 +290,7 @@ pub const Model = struct {
++         m.dense.unload();
++         m.w.deinit();
++         if (m.scatter) |*x| x.deinit();
+++        if (m.pfd) |*p| p.deinit();
++         if (m.group) |*g| g.close();
++         m.stream.deinit();
++         m.gpa.destroy(m);
++@@ -429,6 +434,12 @@ pub const Model = struct {
++         }
++     }
++ 
+++    /// A layer projection: a prompt call's by pfdense where it takes the weight, else the trellis kernel's.
+++    fn proj(m: *Model, hw: *const Header, w: cuda.exl3.Weight, x: u64, xd: cuda.exl3.DType, n: usize, y: u64, yd: cuda.exl3.DType) !void {
+++        if (m.pfd) |*p| if (hw.op == @backingInt(Op.prompt) and Pfd.takes(w)) return p.run(m.stream, m.dense.lin.rot_in, w, x, xd, n, y, yd);
+++        return m.dense.prompt(m.stream, w, x, xd, n, y, yd);
+++    }
+++
++     /// n rows of o_proj or down_proj partials (parts + rank * n rows) summed over the ranks into `into`.
++     fn sumParts(m: *Model, into: u64, n: usize) !void {
++         const h = m.c.hidden;
++@@ -549,11 +560,11 @@ pub const Model = struct {
++             const kc = ca.kv.ptr;
++             const vc = ca.kv.ptr + m.slots * ca.ring * kw * 2;
++             try m.norms.rms(s, b.x, .f32, l.input_norm, b.y, .f16, n, h, c.eps);
++-            try m.dense.prompt(s, l.q, b.y, .f16, n, b.q, .bf16);
++-            try m.dense.prompt(s, l.k, b.y, .f16, n, b.k, .bf16);
++-            try m.dense.prompt(s, l.g, b.y, .f16, n, b.g, .f16);
+++            try m.proj(hw, l.q, b.y, .f16, n, b.q, .bf16);
+++            try m.proj(hw, l.k, b.y, .f16, n, b.k, .bf16);
+++            try m.proj(hw, l.g, b.y, .f16, n, b.g, .f16);
++             try m.k.lerp(s, b.seed, b.y, b.vin, n * h, l.blend); // only V sees the value residual
++-            try m.dense.prompt(s, l.v, b.vin, .f16, n, b.v, .bf16);
+++            try m.proj(hw, l.v, b.vin, .f16, n, b.v, .bf16);
++             const src: cuda.qk_rows.Src = .{ .q = b.q, .q_ld = @intCast(qw), .q_hs = hd, .k = b.k, .k_ld = @intCast(kw), .k_hs = hd, .v = b.v, .v_ld = @intCast(kw), .v_hs = hd };
++             const shape: cuda.qk_rows.Shape = if (l.global) .{ .norms = l.qk_norm, .eps = c.eps } else .{ .norms = l.qk_norm, .inv = b.inv, .rot = hd, .eps = c.eps };
++             try m.qk.rowsFrom(s, src, .{ .h = m.hq, .hk = m.hk, .dim = hd }, shape, pos, slots, .{ .q = b.qo, .k = b.ko, .v = b.vo, .kc = kc, .vc = vc, .len = ca.ring }, n);
++@@ -573,18 +584,18 @@ pub const Model = struct {
++                 try m.tree.run(s, b.qo, b.ko, b.vo, rws, Tree.scratch(b.tree, n, m.hq, m.hk, ng, hd), b.q, n, m.hq, m.hk, hd, ng, c.scale());
++             }
++             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
++-            if (world == 1) try m.dense.prompt(s, l.o, b.gated, .f16, n, b.a, .f32) else {
++-                try m.dense.prompt(s, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+++            if (world == 1) try m.proj(hw, l.o, b.gated, .f16, n, b.a, .f32) else {
+++                try m.proj(hw, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++                 try m.sumParts(b.a, n);
++             }
++             try m.k.normAdd(s, b.a, l.post_attn, b.x, n, h, c.eps);
++             try m.norms.rms(s, b.x, .f32, l.pre_ffn, b.y, .f16, n, h, c.eps);
++             const gu_up = b.gu + n * m.ff * 2;
++-            try m.dense.prompt(s, l.gate, b.y, .f16, n, b.gu, .f16);
++-            try m.dense.prompt(s, l.up, b.y, .f16, n, gu_up, .f16);
+++            try m.proj(hw, l.gate, b.y, .f16, n, b.gu, .f16);
+++            try m.proj(hw, l.up, b.y, .f16, n, gu_up, .f16);
++             try m.k.swiglu(s, b.gu, gu_up, b.act, n * m.ff, c.clamp);
++-            if (world == 1) try m.dense.prompt(s, l.down, b.act, .f16, n, b.a, .f32) else {
++-                try m.dense.prompt(s, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+++            if (world == 1) try m.proj(hw, l.down, b.act, .f16, n, b.a, .f32) else {
+++                try m.proj(hw, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++                 try m.sumParts(b.a, n);
++             }
++             try m.k.normAdd(s, b.a, l.post_ffn, b.x, n, h, c.eps);
++diff --git a/zig/src/families/ricursive/cuda_pfd.zig b/zig/src/families/ricursive/cuda_pfd.zig
++new file mode 100644
++index 000000000..c3c4207e2
++--- /dev/null
+++++ b/zig/src/families/ricursive/cuda_pfd.zig
++@@ -0,0 +1,90 @@
+++//! Prompt rows' projections by pfdense (exl3_block/pfdense.cuh, DeepSeek-V4.1's fused prefill GEMM): exl3's own rot_in,
+++//! then a tensor-core GEMM that decodes the trellis inside it, with the output Hadamard and svh in its epilogue. On a
+++//! GB10 at a four-rank cut it runs Ripple's projections at 39 TFLOPS at 128 rows and 61-68 from 512 (the trellis
+++//! kernel: 30), but not in the trellis kernel's order, so prompt rows no longer give decode rows' bits.
+++//! TF_RICURSIVE_PFD=0 keeps the trellis kernel for prompts.
+++const std = @import("std");
+++const cuda = @import("cuda");
+++
+++/// pfdense_args.h (BM, WM, WN, KS, NST) of the two configurations ricursive_pfd.cu builds (ids 0 and 5 there).
+++const cfgs = [_][5]u32{ .{ 128, 2, 4, 2, 3 }, .{ 128, 2, 4, 2, 2 } };
+++const use = 1; // id 5: the fastest at 128, 512 and 2048 rows of Ripple's shapes, level with id 0 at 1024 and 4096
+++const k2 = 10;
+++
+++/// dsv41_pfd::Args.
+++const Args = extern struct {
+++    xh: u64,
+++    T: u64,
+++    stride_k: i64,
+++    stride_nb: i64,
+++    svh: u64,
+++    bias: u64 = 0,
+++    out: u64,
+++    o_stride: i64,
+++    M: c_int,
+++    K: c_int,
+++    N: c_int,
+++    group: c_int = 8,
+++    out_type: c_int,
+++};
+++
+++comptime {
+++    std.debug.assert(@offsetOf(Args, "M") == 64 and @sizeOf(Args) == 88);
+++}
+++
+++/// Lay<K2, LANES, Cfg>::SMEM.
+++fn smem(c: [5]u32) u32 {
+++    const bm, const wm, _, const ks, const nst = c;
+++    const a_bytes = bm * (16 * ks) * 2;
+++    const w_bytes = ks * 8 * (4 * k2) * 4;
+++    const main = nst * (a_bytes + w_bytes) + 2 * (ks * 8 * 32 * 16);
+++    return @max(main, (bm / wm) * 128 * 2 * 2);
+++}
+++
+++fn symbol(comptime c: [5]u32) [:0]const u8 {
+++    return std.fmt.comptimePrint("_ZN9dsv41_pfd10pfd_kernelILi{d}ELb0ENS_3CfgILi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEEEvNS_4ArgsE", .{ k2, c[0], c[1], c[2], c[3], c[4] });
+++}
+++
+++pub const Pfd = struct {
+++    mod: cuda.Module,
+++    gemm: cuda.Function,
+++    xh: cuda.DeviceBuffer, // the rotated fp16 inputs, `rows` rows of the widest K
+++
+++    pub fn load(d: *const cuda.Driver, rows: usize, k_max: usize) !Pfd {
+++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+++        var mod = try cuda.Module.load(d, cuda.kernels.ricursive_pfd);
+++        errdefer mod.unload();
+++        const f = try mod.function(symbol(cfgs[use]));
+++        try f.allowDynamicShared(smem(cfgs[use]));
+++        return .{ .mod = mod, .gemm = f, .xh = try cuda.DeviceBuffer.alloc(d, rows * k_max * 2) };
+++    }
+++
+++    pub fn deinit(p: *Pfd) void {
+++        p.xh.free();
+++        p.mod.unload();
+++    }
+++
+++    /// Whether pfdense takes `w`: 5.0 bpw mul1 trellis words in the stored layout, no bias.
+++    pub fn takes(w: cuda.exl3.Weight) bool {
+++        const st = cuda.exl3.strides(w.k, w.n, w.halves, false);
+++        return w.halves == k2 and w.codebook == .mul1 and w.bias == 0 and w.stride_k == st.k and w.stride_nb == st.nb and w.k % 128 == 0 and w.n % 128 == 0;
+++    }
+++
+++    /// y [rows, n] (y_dtype) = x [rows, k] (x_dtype) through `w`, on `s`; `rot` is exl3.Linear's tf_exl3_rot_in.
+++    pub fn run(p: *const Pfd, s: cuda.Stream, rot: cuda.Function, w: cuda.exl3.Weight, x: u64, x_dtype: cuda.exl3.DType, rows: usize, y: u64, y_dtype: cuda.exl3.DType) !void {
+++        var r: cuda.Args = .{};
+++        r.add(x);
+++        r.add(w.suh);
+++        r.add(p.xh.ptr);
+++        r.add(@as(i32, @backingInt(x_dtype)));
+++        r.add(@as(i32, @intCast(rows)));
+++        r.add(@as(i32, @intCast(w.k)));
+++        try cuda.launch.launch(rot, .{ .grid = .{ .x = @intCast((w.k / 128 + 3) / 4), .y = @intCast(rows) }, .block = .{ .x = 128 } }, s, &r);
+++        const a: Args = .{ .xh = p.xh.ptr, .T = w.trellis, .stride_k = @intCast(w.stride_k), .stride_nb = @intCast(w.stride_nb), .svh = w.svh, .out = y, .o_stride = @intCast(w.n), .M = @intCast(rows), .K = @intCast(w.k), .N = @intCast(w.n), .out_type = @backingInt(y_dtype) };
+++        var g: cuda.Args = .{};
+++        g.add(a);
+++        const bm = cfgs[use][0];
+++        const threads = cfgs[use][1] * cfgs[use][2] * 32;
+++        try cuda.launch.launch(p.gemm, .{ .grid = .{ .x = @intCast(((rows + bm - 1) / bm) * (w.n / 128)) }, .block = .{ .x = threads }, .shared = smem(cfgs[use]) }, s, &g);
+++    }
+++};
++-- 
++2.43.0
++
+diff --git a/patches-zig/0013-ricursive-prompt-calls-layer-tails-in-two-halves-eac.patch b/patches-zig/0013-ricursive-prompt-calls-layer-tails-in-two-halves-eac.patch
+new file mode 100644
+index 0000000..b2bc839
+--- /dev/null
++++ b/patches-zig/0013-ricursive-prompt-calls-layer-tails-in-two-halves-eac.patch
+@@ -0,0 +1,162 @@
++From a028db87096ad85faedd607e32e4d4bff2241f91 Mon Sep 17 00:00:00 2001
++From: operator <225459632+operator@users.noreply.github.com>
++Date: Sat, 14 Nov 2026 06:25:39 +0000
++Subject: [PATCH 13/15] ricursive: prompt calls' layer tails in two halves,
++ each half's sum overlapped with the other's compute (same bits)
++
++At four ranks the row-scatter sums were 28% of a prompt's GPU time on rank 0, run after the compute they wait for.
++A prompt call of 256 rows or more now runs o_proj through post_ffn in two row halves; each half's sum goes to a
++second, highest-priority stream behind an event while the other half computes, so only down_proj's second-half sum
++is waited out. Each row runs the same kernels on the same inputs, so the bits stay (greedy goldens byte-identical to
++the one-pass build). TF_RICURSIVE_OVERLAP=0 runs one pass. Four GB10s: cold prefill 1,038-1,051 -> 1,172-1,175 tok/s
++at 7.6K tokens, 1,015 -> 1,114-1,118 at 30K.
++---
++ zig/src/families/ricursive/cuda_forward.zig | 14 +++-
++ zig/src/families/ricursive/cuda_overlap.zig | 75 +++++++++++++++++++++
++ 2 files changed, 87 insertions(+), 2 deletions(-)
++ create mode 100644 zig/src/families/ricursive/cuda_overlap.zig
++
++diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
++index 4a8f36364..c0a49761b 100644
++--- a/zig/src/families/ricursive/cuda_forward.zig
+++++ b/zig/src/families/ricursive/cuda_forward.zig
++@@ -9,6 +9,7 @@ const Kernels = @import("cuda_kernels.zig").Kernels;
++ const kept = @import("cuda_kept.zig");
++ const Scatter = @import("cuda_scatter.zig").Scatter;
++ const Pfd = @import("cuda_pfd.zig").Pfd;
+++const ovl = @import("cuda_overlap.zig");
++ 
++ const hd = config.head_dim;
++ const Tree = cuda.tree_attention.TreeAttention;
++@@ -115,7 +116,8 @@ pub const Model = struct {
++     k: Kernels,
++     group: ?cuda.tp_group.Group = null,
++     pfd: ?Pfd = null, // prompt rows' projections by pfdense (cuda_pfd.zig); null: the trellis kernel
++-    scatter: ?Scatter = null, // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
+++    scatter: ?Scatter = null,
+++    overlap: ?ovl.Overlap = null, // with the scatter: prompt calls' layer tails in two overlapped halves // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
++     caches: []Cache = &.{},
++     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++     // a rank's heads, key heads, FFN width and vocab share
++@@ -162,6 +164,8 @@ pub const Model = struct {
++             if (o.roce and world > 2) try roce_multi.open(gpa, io, d, &m.group.?, true);
++             const off = if (std.c.getenv("TF_RICURSIVE_SCATTER")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++             if (world > 2 and !off) m.scatter = try Scatter.init(d, max_rows, world, c.hidden);
+++            const no_ovl = if (std.c.getenv("TF_RICURSIVE_OVERLAP")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+++            if (m.scatter != null and !no_ovl) m.overlap = try ovl.Overlap.init(d);
++         }
++         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
++         m.dense = try cuda.exl3.Dense.load(d);
++@@ -289,6 +293,7 @@ pub const Model = struct {
++         m.norms.unload();
++         m.dense.unload();
++         m.w.deinit();
+++        if (m.overlap) |*o| o.deinit();
++         if (m.scatter) |*x| x.deinit();
++         if (m.pfd) |*p| p.deinit();
++         if (m.group) |*g| g.close();
++@@ -435,7 +440,7 @@ pub const Model = struct {
++     }
++ 
++     /// A layer projection: a prompt call's by pfdense where it takes the weight, else the trellis kernel's.
++-    fn proj(m: *Model, hw: *const Header, w: cuda.exl3.Weight, x: u64, xd: cuda.exl3.DType, n: usize, y: u64, yd: cuda.exl3.DType) !void {
+++    pub fn proj(m: *Model, hw: *const Header, w: cuda.exl3.Weight, x: u64, xd: cuda.exl3.DType, n: usize, y: u64, yd: cuda.exl3.DType) !void {
++         if (m.pfd) |*p| if (hw.op == @backingInt(Op.prompt) and Pfd.takes(w)) return p.run(m.stream, m.dense.lin.rot_in, w, x, xd, n, y, yd);
++         return m.dense.prompt(m.stream, w, x, xd, n, y, yd);
++     }
++@@ -584,6 +589,11 @@ pub const Model = struct {
++                 try m.tree.run(s, b.qo, b.ko, b.vo, rws, Tree.scratch(b.tree, n, m.hq, m.hk, ng, hd), b.q, n, m.hq, m.hk, hd, ng, c.scale());
++             }
++             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
+++            if (m.overlap) |*o| if (hw.op == @backingInt(Op.prompt) and n >= ovl.min_rows and capture == null) {
+++                try o.run(m, hw, l, n);
+++                if (m.tapk) |*tk| for (m.taps[0..m.n_taps], 0..) |t, ti| if (t == li) try tk.taps(s, b.x, pos, slots, m.tap_ring, tap_rows, m.n_taps, ti, h, n);
+++                continue;
+++            };
++             if (world == 1) try m.proj(hw, l.o, b.gated, .f16, n, b.a, .f32) else {
++                 try m.proj(hw, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++                 try m.sumParts(b.a, n);
++diff --git a/zig/src/families/ricursive/cuda_overlap.zig b/zig/src/families/ricursive/cuda_overlap.zig
++new file mode 100644
++index 000000000..b00f9f8ed
++--- /dev/null
+++++ b/zig/src/families/ricursive/cuda_overlap.zig
++@@ -0,0 +1,75 @@
+++//! A prompt call's o_proj through post_ffn in two row halves at three ranks or more: each half's row-scatter sum
+++//! (cuda_scatter.zig) runs on a second stream while the other half computes. The sum of o_proj's first half overlaps
+++//! o_proj's second half, the second half's sum the first half's MLP, and down_proj's first-half sum the second half's
+++//! MLP; only down_proj's second-half sum is waited out. Every row runs the same kernels on the same inputs as in one
+++//! pass, so the bits do not change. TF_RICURSIVE_OVERLAP=0 runs one pass.
+++const std = @import("std");
+++const cuda = @import("cuda");
+++
+++/// Rows a call takes before it splits: halves of at least one pfdense row tile (128 rows) each.
+++pub const min_rows = 256;
+++
+++pub const Overlap = struct {
+++    comm: cuda.Stream, // the sums' stream (highest priority, so its kernels take SMs as they free)
+++    ready: [4]cuda.Event, // a half's partials written (o_proj 0, 1; down_proj 0, 1)
+++    summed: [4]cuda.Event, // that half's sums in `a`
+++
+++    pub fn init(d: *const cuda.Driver) !Overlap {
+++        var o: Overlap = .{ .comm = try cuda.Stream.initPriority(d, .highest), .ready = undefined, .summed = undefined };
+++        for (&o.ready, &o.summed) |*r, *s| {
+++            r.* = try cuda.Event.init(d, false);
+++            s.* = try cuda.Event.init(d, false);
+++        }
+++        return o;
+++    }
+++
+++    pub fn deinit(o: *Overlap) void {
+++        for (&o.ready, &o.summed) |*r, *s| {
+++            r.deinit();
+++            s.deinit();
+++        }
+++        o.comm.deinit();
+++    }
+++
+++    /// Model's layer tail for `n` prompt rows of layer `l` (gated rows in b.gated), as cuda_forward's single pass.
+++    pub fn run(o: *Overlap, m: anytype, hw: anytype, l: anytype, n: usize) !void {
+++        const s = m.stream;
+++        const c = m.c;
+++        const b = &m.b;
+++        const h = c.hidden;
+++        const qw = m.hq * @import("config.zig").head_dim;
+++        const g = &m.group.?;
+++        const x = &m.scatter.?;
+++        const mid = std.mem.alignForward(usize, n / 2, 16);
+++        const halves = [2][2]usize{ .{ 0, mid }, .{ mid, n } };
+++        const mine = b.parts + m.rank() * n * h * 4; // this rank's partials, rows in order
+++        const gu_up = b.gu + n * m.ff * 2;
+++        for (halves, 0..) |r, i| {
+++            try m.proj(hw, l.o, b.gated + r[0] * qw * 2, .f16, r[1] - r[0], mine + r[0] * h * 4, .f32);
+++            try o.sumAfter(s, x, g, i, mine + r[0] * h * 4, r[1] - r[0], h, b.a + r[0] * h * 4);
+++        }
+++        for (halves, 0..) |r, i| {
+++            const nh = r[1] - r[0];
+++            try s.wait(o.summed[i]);
+++            try m.k.normAdd(s, b.a + r[0] * h * 4, l.post_attn, b.x + r[0] * h * 4, nh, h, c.eps);
+++            try m.norms.rms(s, b.x + r[0] * h * 4, .f32, l.pre_ffn, b.y + r[0] * h * 2, .f16, nh, h, c.eps);
+++            try m.proj(hw, l.gate, b.y + r[0] * h * 2, .f16, nh, b.gu + r[0] * m.ff * 2, .f16);
+++            try m.proj(hw, l.up, b.y + r[0] * h * 2, .f16, nh, gu_up + r[0] * m.ff * 2, .f16);
+++            try m.k.swiglu(s, b.gu + r[0] * m.ff * 2, gu_up + r[0] * m.ff * 2, b.act + r[0] * m.ff * 2, nh * m.ff, c.clamp);
+++            try m.proj(hw, l.down, b.act + r[0] * m.ff * 2, .f16, nh, mine + r[0] * h * 4, .f32);
+++            try o.sumAfter(s, x, g, 2 + i, mine + r[0] * h * 4, nh, h, b.a + r[0] * h * 4);
+++        }
+++        for (halves, 0..) |r, i| {
+++            try s.wait(o.summed[2 + i]);
+++            try m.k.normAdd(s, b.a + r[0] * h * 4, l.post_ffn, b.x + r[0] * h * 4, r[1] - r[0], h, c.eps);
+++        }
+++    }
+++
+++    /// Slot `i`: the comm stream waits for what `s` queued so far, then sums `rows` rows into `into` there.
+++    fn sumAfter(o: *Overlap, s: cuda.Stream, x: anytype, g: anytype, i: usize, partial: u64, rows: usize, width: usize, into: u64) !void {
+++        try o.ready[i].record(s);
+++        try o.comm.wait(o.ready[i]);
+++        try x.sum(g, o.comm, partial, rows, width, into);
+++        try o.summed[i].record(o.comm);
+++    }
+++};
++-- 
++2.43.0
++
+diff --git a/patches-zig/0014-ricursive-shared-rounds-of-64-rows-one-drafter-pass-.patch b/patches-zig/0014-ricursive-shared-rounds-of-64-rows-one-drafter-pass-.patch
+new file mode 100644
+index 0000000..b8fc74b
+--- /dev/null
++++ b/patches-zig/0014-ricursive-shared-rounds-of-64-rows-one-drafter-pass-.patch
+@@ -0,0 +1,363 @@
++From 24698c7cfa0da76844981f1de5d5878537022b3a Mon Sep 17 00:00:00 2001
++From: operator <225459632+operator@users.noreply.github.com>
++Date: Sat, 14 Nov 2026 09:24:06 +0000
++Subject: [PATCH 14/15] ricursive: shared rounds of 64 rows, one drafter pass a
++ round, its pass timed and priced, absorbs batched
++
++Several streams' decode stalled: a shared round held 16 rows over every stream (round_rows), so 8 streams verified
++at most one draft each and 16 none, though a GB10 window of 16 rows costs 75 ms against 59 for one. Now:
++- a round takes up to 64 rows over its streams (tree_rows; a stream's window stays 16), its widths timed at load
++  (24-64 rows), so the depth rule prices shared rounds by what they cost, not the widest window scaled;
++- the drafter holds every stream of a round in one pass (hold_streams 16: the lane core prices a batched head as one);
++- the drafter times that pass at load by streams and depth (1-16 streams: 14.6 / 22.1 / 54.6 ms at depth 15 on
++  four GB10s) and reports hold_costs; the lane core's shared budget (rule.budgets) and headMs price a timed pass by
++  its streams and deepest chain instead of step_ms times steps (no other family reports hold_costs);
++- a round's verified rows go to the drafter in one plan word and one pass (draft_absorbs): each stream's taps side
++  by side, one fc rank sum and one K/V matmul a layer, not two collectives and eleven GEMMs a stream.
++Replies are unchanged (greedy goldens byte-identical). Four GB10s, 16 x 128K, SparkMan code decode at 1/2/4/8/16
++streams 70.1/106.4/125.7/119.8/148.9 -> 69.6/107.4/153.3/194.0/228.6 tok/s; prose (T 0.7) 26.9/47.9/70.7/90.1/170.0 ->
++26.2/46.6/74.8/100.9/146.3.
++---
++ zig/src/core/lanes/allocate.zig             |   6 +-
++ zig/src/core/lanes/depth.zig                |  13 ++-
++ zig/src/families/ricursive/cuda_draft.zig   | 119 ++++++++++++++++++--
++ zig/src/families/ricursive/cuda_forward.zig |   8 +-
++ zig/src/families/ricursive/cuda_lanes.zig   |   6 +-
++ zig/src/families/ricursive/cuda_native.zig  |   4 +-
++ 6 files changed, 139 insertions(+), 17 deletions(-)
++
++diff --git a/zig/src/core/lanes/allocate.zig b/zig/src/core/lanes/allocate.zig
++index 3fea08998..ec922b99f 100644
++--- a/zig/src/core/lanes/allocate.zig
+++++ b/zig/src/core/lanes/allocate.zig
++@@ -2,6 +2,7 @@
++ const std = @import("std");
++ const Allocator = std.mem.Allocator;
++ const Table = @import("table.zig").Table;
+++const hold_price = @import("hold_price.zig");
++ 
++ /// A batched head's extra drafts cost the deepest stream's steps; FZ_PRICE_BATCHED=0 prices each stream's.
++ pub fn pricedBatched() bool {
++@@ -22,6 +23,7 @@ pub const HeadCost = struct {
++     batched: bool = false,
++     free_first: bool = false,
++     row_ms: f64 = 0.0, // what each row past a stream's first costs past the table on this machine
+++    hold: []const hold_price.HoldCost = &.{}, // a drafter's own pass by the streams it drafts: priced instead of steps
++ };
++ 
++ /// allocate, each stream's drafts past its first costing one more head step.
++@@ -66,7 +68,9 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
++         deepest = @max(deepest, counts[s]);
++         expected += pick_p;
++         const steps: f64 = @floatFromInt(if (head.batched) deepest -| @intFromBool(head.free_first) else drafts - (if (head.free_first) firsts else 0));
++-        const now = rate(costs, timed, rows, expected, overhead_ms + head.step_ms * steps + head.row_ms * @as(f64, @floatFromInt(rows -| live)));
+++        // a drafter that timed its pass prices it by the streams drafting and the deepest chain, not by steps
+++        const head_ms = if (head.hold.len > 0) hold_price.holdMs(head.hold, @intCast(firsts), deepest) else head.step_ms * steps;
+++        const now = rate(costs, timed, rows, expected, overhead_ms + head_ms + head.row_ms * @as(f64, @floatFromInt(rows -| live)));
++         if (now > best or (!timed and head.step_ms == 0)) {
++             best = now;
++             @memcpy(best_counts, counts);
++diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
++index 2d04b218e..347c428f2 100644
++--- a/zig/src/core/lanes/depth.zig
+++++ b/zig/src/core/lanes/depth.zig
++@@ -337,9 +337,9 @@ pub const Rule = struct {
++         const ones = try r.gpa.alloc(u32, whos.len);
++         defer r.gpa.free(ones);
++         @memset(ones, 1);
++-        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled) };
+++        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled), .hold = r.k.hold_costs };
++         const counts = if (r.draft_step_ms != 0)
++-            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled) })
+++            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled), .hold = r.k.hold_costs })
++         else
++             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
++         defer r.gpa.free(counts);
++@@ -401,6 +401,15 @@ pub const Rule = struct {
++ 
++     /// The modeled time of a shared round's head steps for the depths it drafted.
++     pub fn headMs(r: *const Rule, depths: []const i64) f64 {
+++        if (r.k.hold_costs.len > 0) { // a timed pass: its streams and deepest chain, as allocateDrafts prices it
+++            var streams: usize = 0;
+++            var deep: i64 = 0;
+++            for (depths) |d| if (d > 0) {
+++                streams += 1;
+++                deep = @max(deep, d);
+++            };
+++            return if (streams == 0) 0 else holdMs(r.k.hold_costs, streams, deep);
+++        }
++         var steps: i64 = 0;
++         for (depths) |d| steps = if (r.batched_heads) @max(steps, d) else steps + d;
++         return r.mtp_step_ms * @as(f64, @floatFromInt(steps));
++diff --git a/zig/src/families/ricursive/cuda_draft.zig b/zig/src/families/ricursive/cuda_draft.zig
++index 280f55cd6..6f1728210 100644
++--- a/zig/src/families/ricursive/cuda_draft.zig
+++++ b/zig/src/families/ricursive/cuda_draft.zig
++@@ -12,7 +12,7 @@ const Cost = lanes.config.Cost;
++ /// cuBLASLt's workspace for the drafter's matmuls.
++ const work_bytes = 32 << 20;
++ /// Streams one hold runs together (a round's others go in further holds), and the widest block.
++-const hold_streams = 4;
+++const hold_streams = fwd.max_streams; // every stream of a shared round in one hold (the lane core prices a batched head as one pass)
++ const max_block = 16;
++ 
++ /// A stream's context: its layers' key and value rings over positions [begin, end), and the chain it holds.
++@@ -45,6 +45,8 @@ pub const Draft = struct {
++     step_ms: f64 = 1.0,
++     costs: [fwd.tree_rows]Cost = undefined,
++     n_costs: usize = 0,
+++    holds: [10]lanes.hold_price.HoldCost = undefined, // the hold pass by streams (1 to 16) and depth (1, block - 1)
+++    n_holds: usize = 0,
++ 
++     /// The drafter in `dir` over the target `m`, this rank's share; rank 0 first has rank 1 open its own.
++     pub fn init(gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, dir: []const u8) !*Draft {
++@@ -360,7 +362,9 @@ pub const Draft = struct {
++     pub fn time(d: *Draft) !void {
++         var toks: [fwd.tree_rows]u32 = undefined;
++         for (&toks, 0..) |*t, i| t.* = @intCast(1000 + i);
++-        for (1..fwd.tree_rows + 1) |w| {
+++        const widths = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 40, 48, 56, 64 }; // to fwd.tree_rows: shared rounds priced by their own rows
+++        comptime std.debug.assert(widths[widths.len - 1] == fwd.tree_rows);
+++        for (widths, 0..) |w, wi| {
++             var best = std.math.inf(f64);
++             for (0..3) |_| {
++                 const t0 = std.Io.Clock.awake.now(d.io);
++@@ -368,9 +372,9 @@ pub const Draft = struct {
++                 try d.m.stream.synchronize();
++                 best = @min(best, ms(d.io, t0));
++             }
++-            d.costs[w - 1] = .{ .width = @intCast(w), .ms = best };
+++            d.costs[wi] = .{ .width = @intCast(w), .ms = best };
++         }
++-        d.n_costs = fwd.tree_rows;
+++        d.n_costs = widths.len;
++         const x = try d.create();
++         var best = std.math.inf(f64);
++         for (0..4) |_| {
++@@ -381,9 +385,42 @@ pub const Draft = struct {
++         }
++         try d.pool.append(d.gpa, x);
++         d.step_ms = best / @as(f64, @floatFromInt(d.c.block - 1));
+++        try d.timeHolds();
++         // TF_RIPPLE_DRAFT_STEP_MS: the round loop's price of one more draft (a block costs the same at any depth)
++         if (std.c.getenv("TF_RIPPLE_DRAFT_STEP_MS")) |v| d.step_ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch d.step_ms;
++-        std.log.info("ricursive: target windows 1 / 2 / 16 rows {d:.1} / {d:.1} / {d:.1} ms, a draft block {d:.1} ms", .{ d.costs[0].ms, d.costs[1].ms, d.costs[15].ms, best });
+++        std.log.info("ricursive: target windows 1 / 2 / 16 / 32 / 64 rows {d:.1} / {d:.1} / {d:.1} / {d:.1} / {d:.1} ms, a draft block {d:.1} ms", .{ d.costs[0].ms, d.costs[1].ms, d.costs[15].ms, d.costs[17].ms, d.costs[21].ms, best });
+++    }
+++
+++    /// The hold pass of 1, 2, 4, 8 and 16 streams (as many as the slots allow), 1 and block - 1 drafts deep: what the
+++    /// lane core charges a shared round for drafting (one pass takes every stream; its cost grows with them, barely
+++    /// with depth), in place of step_ms times the depth.
+++    fn timeHolds(d: *Draft) !void {
+++        const most = @min(fwd.max_streams, d.m.slots);
+++        var xs: [fwd.max_streams]*Ctx = undefined;
+++        var got: usize = 0;
+++        defer for (xs[0..got]) |x| d.pool.append(d.gpa, x) catch d.drop(x);
+++        while (got < most) : (got += 1) xs[got] = d.pool.pop() orelse try d.create();
+++        var items: [fwd.max_streams]dr.Hold = undefined;
+++        d.n_holds = 0;
+++        for ([_]usize{ 1, 2, 4, 8, 16 }) |k| {
+++            if (k > most) break;
+++            for ([_]u32{ 1, @intCast(d.c.block - 1) }) |depth| {
+++                for (items[0..k], xs[0..k]) |*it, x| {
+++                    it.* = .{ .stream = undefined, .pending = 1000, .position = 2, .depth = depth };
+++                    x.* = .{ .ring = x.ring, .id = x.id, .end = 1 };
+++                }
+++                var best = std.math.inf(f64);
+++                for (0..3) |_| {
+++                    for (xs[0..k]) |x| x.* = .{ .ring = x.ring, .id = x.id, .end = 1 };
+++                    const t0 = std.Io.Clock.awake.now(d.io);
+++                    try d.hold(items[0..k], xs[0..k]);
+++                    best = @min(best, ms(d.io, t0));
+++                }
+++                d.holds[d.n_holds] = .{ .streams = @intCast(k), .depth = depth, .ms = best };
+++                d.n_holds += 1;
+++            }
+++        }
+++        std.log.info("ricursive: a hold pass of 1 / 4 / {d} streams at depth {d}: {d:.1} / {d:.1} / {d:.1} ms", .{ d.holds[d.n_holds - 1].streams, d.c.block - 1, d.holds[1].ms, if (d.n_holds > 5) d.holds[5].ms else d.holds[d.n_holds - 1].ms, d.holds[d.n_holds - 1].ms });
++     }
++ 
++     fn ms(io: std.Io, t0: std.Io.Timestamp) f64 {
++@@ -407,7 +444,7 @@ pub const Draft = struct {
++ 
++     fn factsFn(p: *anyopaque) dr.Facts {
++         const d = cast(p);
++-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
+++        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .hold_costs = d.holds[0..d.n_holds] };
++     }
++ 
++     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
++@@ -422,6 +459,9 @@ pub const Draft = struct {
++     fn absorbFn(p: *anyopaque, items: []const dr.Absorb) anyerror!void {
++         const d = cast(p);
++         const most = d.c.ringRows() - d.c.block;
+++        var many: [fwd.max_streams]Piece = undefined;
+++        var k: usize = 0;
+++        var total: u64 = 0;
++         for (items) |it| {
++             const x = d.streams.get(it.stream) orelse return error.UnknownStream;
++             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
++@@ -442,8 +482,62 @@ pub const Draft = struct {
++                 }
++             }
++             const row = fwd.tap_rows * d.c.n_taps * d.c.hidden * 2;
++-            try d.absorb(x, @intCast((it.features.buffer - d.m.tap_ring) / row), start, @intCast(n));
+++            const slot: usize = @intCast((it.features.buffer - d.m.tap_ring) / row);
+++            if (n == 0) continue;
+++            // a round's verified rows (a few a stream): every stream in one pass below; a prompt's on its own
+++            if (n <= fwd.window_max and k < fwd.max_streams and total + n <= fwd.max_rows) {
+++                many[k] = .{ .x = x, .slot = slot, .start = start, .rows = @intCast(n) };
+++                k += 1;
+++                total += n;
+++            } else try d.absorb(x, slot, start, @intCast(n));
+++        }
+++        if (k == 1) return d.absorb(many[0].x, many[0].slot, many[0].start, many[0].rows);
+++        if (k > 1) try d.absorbBatch(many[0..k]);
+++    }
+++
+++    pub const Piece = struct { x: *Ctx, slot: usize, start: u64, rows: usize };
+++
+++    /// Several streams' verified rows in one plan word and one pass: each stream's taps gathered side by side, then
+++    /// fc (one rank sum), the norm and every layer's K and V over all their rows, each stream's into its own rings.
+++    fn absorbBatch(d: *Draft, ps: []const Piece) !void {
+++        const most = d.c.ringRows() - d.c.block;
+++        var h: fwd.Header = .{ .op = @backingInt(fwd.Op.draft_absorbs), .ns = @intCast(ps.len) };
+++        for (ps, 0..) |p, i| {
+++            const x = p.x;
+++            if (p.start < x.end) x.end = p.start;
+++            if (p.start > x.end or x.begin > p.start) x.begin = p.start;
+++            if (p.start + p.rows > x.begin + most) x.begin = p.start + p.rows - most;
+++            h.streams[i] = .{ x.id, @intCast(p.slot), @intCast(p.start), @intCast(p.rows) };
+++            h.pos[i] = @intCast(x.begin);
+++        }
+++        if (d.world > 1) try d.m.plan(&h);
+++        try d.absorbMany(ps);
+++    }
+++
+++    /// Every rank: absorbRows for several streams at once (their rows side by side in the pass buffers).
+++    pub fn absorbMany(d: *Draft, ps: []const Piece) !void {
+++        const c = d.c;
+++        const s = d.m.stream;
+++        const stride = c.n_taps * c.hidden;
+++        const kc = stride / d.world;
+++        var total: usize = 0;
+++        for (ps) |p| {
+++            try d.k.gather(s, d.m.tap_ring + p.slot * fwd.tap_rows * stride * 2, fwd.tap_rows, p.start, stride, d.rank * kc, kc, d.b.taps + total * kc * 2, p.rows);
+++            total += p.rows;
+++        }
+++        try d.mmSum(d.b.taps, d.w.fc, d.b.th, total, c.hidden, kc);
+++        try d.k.rms(s, d.b.th, d.w.hidden_norm, d.b.thn, c.hidden, c.eps, 0, 0, total);
+++        for (d.w.layers[0..c.layers], 0..) |l, i| {
+++            try d.mm(d.b.thn, l.k, d.b.ka, total, c.kvWidth(), c.hidden);
+++            try d.mm(d.b.thn, l.v, d.b.va, total, c.kvWidth(), c.hidden);
+++            var at: usize = 0;
+++            for (ps) |p| {
+++                const rk = d.ringK(p.x, i);
+++                try d.k.kvPut(s, d.b.ka + at * c.kvWidth() * 4, d.b.va + at * c.kvWidth() * 4, l.k_norm, rk, rk + c.ringRows() * c.kvWidth() * 2, c, p.start, c.rope[i], p.rows);
+++                at += p.rows;
+++            }
++         }
+++        for (ps) |p| p.x.end = p.start + p.rows;
++     }
++ 
++     fn holdFn(p: *anyopaque, items: []const dr.Hold) anyerror!void {
++@@ -487,6 +581,17 @@ pub fn follow(m: *fwd.Model, h: *const fwd.Header) anyerror!void {
++         x.begin = @intCast(h.b);
++         return d.absorbRows(x, @intCast(h.a), @intCast(h.p0), @intCast(h.n));
++     }
+++    if (h.op == @backingInt(fwd.Op.draft_absorbs)) {
+++        if (h.ns <= 0 or h.ns > fwd.max_streams) return error.RicursiveRows;
+++        var ps: [fwd.max_streams]Draft.Piece = undefined;
+++        for (ps[0..@intCast(h.ns)], 0..) |*q, i| {
+++            const e = h.streams[i];
+++            const x = try d.ctxOf(e[0]);
+++            x.begin = @intCast(h.pos[i]);
+++            q.* = .{ .x = x, .slot = @intCast(e[1]), .start = @intCast(e[2]), .rows = @intCast(e[3]) };
+++        }
+++        return d.absorbMany(ps[0..@intCast(h.ns)]);
+++    }
++     if (h.ns <= 0 or h.ns > hold_streams) return error.RicursiveRows;
++     var ctxs: [hold_streams]*Ctx = undefined;
++     for (ctxs[0..@intCast(h.ns)], 0..) |*x, i| x.* = try d.ctxOf(h.streams[i][0]);
++diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
++index c0a49761b..e9f819de8 100644
++--- a/zig/src/families/ricursive/cuda_forward.zig
+++++ b/zig/src/families/ricursive/cuda_forward.zig
++@@ -17,7 +17,9 @@ const max_depth = cuda.tree_attention.max_depth;
++ /// Rows a forward call runs at once: the EXL3 linears' widest call, and tree attention's longest path.
++ pub const max_rows = 1024;
++ /// Rows a tree attention call takes when prompt chunks go to the prompt rows (decode rows only; sizes its scratch).
++-pub const tree_rows = 16;
+++pub const tree_rows = 64;
+++/// A stream's verify window at most (the drafter's block): the rows a round gives a stream to absorb.
+++pub const window_max = 16; // a decode call's rows over every stream (a stream's own window: cuda_lanes.window_rows)
++ /// Streams one decode call holds (each its own slot's rows).
++ pub const max_streams = 16;
++ /// Tap rows a slot's ring holds for a drafter (a prompt chunk and a window, read right after the call that wrote them).
++@@ -72,7 +74,7 @@ pub const Options = struct {
++ };
++ 
++ /// Plan ops: stop, decode rows, a prompt chunk, kept states (save, restore, drop, row copy), hello, a drafter's calls.
++-pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7, taps = 8, draft_open = 9, draft_absorb = 10, draft_hold = 11 };
+++pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7, taps = 8, draft_open = 9, draft_absorb = 10, draft_hold = 11, draft_absorbs = 12 };
++ 
++ /// Rank 0's plan word before each call: op, rows, p0, head rows, slot, a, b; rows' ids/positions/slots; streams.
++ pub const Header = extern struct {
++@@ -434,7 +436,7 @@ pub const Model = struct {
++                     for (t[0..@intCast(@min(@max(h.n, 0), 8))], 0..) |*x, i| x.* = @intCast(h.ids[i]);
++                     try m.setTaps(t[0..@intCast(@min(@max(h.n, 0), 8))]);
++                 },
++-                .draft_open, .draft_absorb, .draft_hold => try (m.draft_hook orelse return error.RicursiveNoDrafter)(m, &h),
+++                .draft_open, .draft_absorb, .draft_hold, .draft_absorbs => try (m.draft_hook orelse return error.RicursiveNoDrafter)(m, &h),
++             }
++         }
++     }
++diff --git a/zig/src/families/ricursive/cuda_lanes.zig b/zig/src/families/ricursive/cuda_lanes.zig
++index 6b618f2fa..2e52b21f5 100644
++--- a/zig/src/families/ricursive/cuda_lanes.zig
+++++ b/zig/src/families/ricursive/cuda_lanes.zig
++@@ -11,7 +11,9 @@ const Stream = lanes.Stream;
++ /// Prompt rows a step takes: the forward's chunk, cut at the prompt cache's marks.
++ pub const prompt_rows: u32 = fwd.max_rows;
++ /// Rows a round takes over every stream (tree attention's decode scratch), and the widest window a stream verifies.
++-pub const round_rows: u32 = fwd.tree_rows;
+++pub const round_rows: u32 = fwd.tree_rows; // a shared round's rows over every stream
+++/// The widest window a stream verifies (the drafter's block) and the one-token steps' exact width.
+++pub const window_rows: u32 = 16;
++ /// Drawn tokens a handle names (a ring; read before the round loop could wrap it).
++ const ring = 1024;
++ 
++@@ -113,7 +115,7 @@ pub const Ripple = struct {
++ 
++     /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
++     pub fn facts(x: *const Ripple) lanes.Model {
++-        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = round_rows, .copy_drafts = x.copies, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)) };
+++        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = window_rows, .copy_drafts = x.copies, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, fwd.max_streams)) };
++     }
++ 
++     fn self(ptr: *anyopaque) *Ripple {
++diff --git a/zig/src/families/ricursive/cuda_native.zig b/zig/src/families/ricursive/cuda_native.zig
++index 10c6f1aae..69f6e19a6 100644
++--- a/zig/src/families/ricursive/cuda_native.zig
+++++ b/zig/src/families/ricursive/cuda_native.zig
++@@ -19,7 +19,7 @@ pub const snap_lookahead: u32 = 0;
++ pub const takes_drafter = true;
++ pub const explains_open = true;
++ /// A request's verify reserve past its prompt and reply.
++-pub const window_rows: u32 = rl.round_rows;
+++pub const window_rows: u32 = rl.window_rows;
++ pub const weightShare = family.weightShare;
++ 
++ pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
++@@ -88,7 +88,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
++     return .{
++         .backend = own.r.backend(),
++         .facts = own.r.facts(),
++-        .rows = rl.round_rows,
+++        .rows = rl.window_rows,
++         .stream_bytes = per,
++         .free_streams = @intCast(slots),
++         .ctx = own,
++-- 
++2.43.0
++
+diff --git a/patches-zig/0015-lanes-shared-rounds-price-a-timed-drafter-pass-by-th.patch b/patches-zig/0015-lanes-shared-rounds-price-a-timed-drafter-pass-by-th.patch
+new file mode 100644
+index 0000000..fed5c98
+--- /dev/null
++++ b/patches-zig/0015-lanes-shared-rounds-price-a-timed-drafter-pass-by-th.patch
+@@ -0,0 +1,54 @@
++From 4f1dd4dc4ff6909d77aa1cbbf76595f978504bd7 Mon Sep 17 00:00:00 2001
++From: operator <225459632+operator@users.noreply.github.com>
++Date: Sat, 14 Nov 2026 16:55:53 +0000
++Subject: [PATCH 15/15] lanes: shared rounds price a timed drafter pass by the
++ streams that draft, not as overhead every option pays
++
++A drafter that reports hold_costs (ricursive) has its pass timed at load, and observeOverhead splits a round's time
++into a fixed share and the pass. shared_drafts.budgets still priced allocation with overheadMs (fixed plus the
++measured pass), so a round drafting none was charged a pass it would not run: at 16 sampled streams on four GB10s
++plain looked like 16 / (75 + 77) ms against drafting's 28 / 187, and every round drafted (0.150 tokens a ms
++measured, against 0.191 for plain rounds). With hold costs it now passes fixedMs and the hold table to
++allocateDrafts, which prices the pass by the drafting streams and the deepest chain (as rule.budgets and headMs
++already do). TF_HOLD_SHARED=0 restores the old pricing. Families without hold_costs are unchanged.
++Replies unchanged (goldens identical to the previous build). Four GB10s, 16 x 128K, same binary A/B:
++prose (T 0.7) 16 streams 143.4 -> 190.3 tok/s, 8 streams 103.2 -> 112.0; SparkMan code decode 16 streams
++221.3 / 237.2 -> 221.1 / 238.4 (unchanged).
++
++Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
++---
++ zig/src/core/lanes/shared_drafts.zig | 12 +++++++++++-
++ 1 file changed, 11 insertions(+), 1 deletion(-)
++
++diff --git a/zig/src/core/lanes/shared_drafts.zig b/zig/src/core/lanes/shared_drafts.zig
++index bf62869f4..c9d7ea877 100644
++--- a/zig/src/core/lanes/shared_drafts.zig
+++++ b/zig/src/core/lanes/shared_drafts.zig
++@@ -56,13 +56,23 @@ pub fn budgets(e: *Engine, plans: []const win.Plan, heads: []const usize, out: [
++         @memset(out, 0);
++         return;
++     }
++-    const counts = try alloc.allocateDrafts(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(@intCast(live), sampled), e.rule.row_cost.capRows(live, sampled, @max(live, e.cfg.batch_rows)), .{ .row_ms = e.rule.row_cost.extraMs(live, sampled) });
+++    // a drafter that timed its hold pass: the pass is priced by the streams that draft and their deepest chain, so a
+++    // round drafting none pays none of it (the measured overhead's head share would charge plain rounds for it too)
+++    const hold = if (holdShared()) e.rule.k.hold_costs else &.{};
+++    const over = if (hold.len > 0) e.rule.fixedMs(@intCast(live), sampled) else e.rule.overheadMs(@intCast(live), sampled);
+++    const counts = try alloc.allocateDrafts(a, fixed, probs, &e.cfg.shared_costs, over, e.rule.row_cost.capRows(live, sampled, @max(live, e.cfg.batch_rows)), .{ .row_ms = e.rule.row_cost.extraMs(live, sampled), .hold = hold });
++     for (heads, out) |i, *budget| {
++         budget.* = if (neural[i]) counts[i] else 0;
++     }
++     if (limits) |l| if (e.cfg.granted_depth) try payReserved(e, l.who, probs, heads, sampled, out);
++ }
++ 
+++/// TF_HOLD_SHARED=0: shared rounds charge the drafter's measured pass to every option, drafting or not (as before).
+++fn holdShared() bool {
+++    const v = std.c.getenv("TF_HOLD_SHARED") orelse return true;
+++    return v[0] != '0';
+++}
+++
++ // Copy lookups may advance a proposer's backoff; the reservation loop, not this depth cap, asks it once.
++ fn noCopy(_: *anyopaque, _: *const depth.Who) bool {
++     return false;
++-- 
++2.43.0
++
+diff --git a/scripts/config.sh b/scripts/config.sh
+index ca76cd5..dc9ee4e 100755
+--- a/scripts/config.sh
++++ b/scripts/config.sh
+@@ -34,7 +34,7 @@ IMAGE="${IMAGE:-ripple-tf}"
+ TF_REPO="https://github.com/ashhart/TensorFold"
+ TF_TAG="v1.2.3"
+ TF_COMMIT="6ec5fa4cb233f3606acbdad5bec433f0f8758f96"
+-ZIG_TREE="${ZIG_TREE:-326a0a51a1c30f2fc59468a1b2f9c2cd6af34aee}"                     # tree hash of v1.2.3 + patches-zig/ (scripts/zig_prepare.sh checks it)
++ZIG_TREE="${ZIG_TREE:-de18a25b239d23fce3cb428db4a0a8c703e4c845}"                     # tree hash of v1.2.3 + patches-zig/ (scripts/zig_prepare.sh checks it)
+ ZIG_DIR="${ZIG_DIR:-$HOME/ripple/tensorfold}"
+ ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-ripple-zig-build:0.17.0}"
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,5 @@
+1 at once:   26.9 tok/s aggregate,  26.9 per request, TTFT  269 ms
+2 at once:   47.3 tok/s aggregate,  24.2 per request, TTFT  401 ms
+4 at once:   76.4 tok/s aggregate,  19.2 per request, TTFT  780 ms
+8 at once:   91.5 tok/s aggregate,  12.2 per request, TTFT 1561 ms
+16 at once:  172.6 tok/s aggregate,  10.8 per request, TTFT 2750 ms

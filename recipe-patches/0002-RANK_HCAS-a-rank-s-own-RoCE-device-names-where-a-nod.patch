@@ -1,0 +1,45 @@
+From 6645892ef688532bf1d64531fd46d06975e1d558 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 16:30:53 +0000
+Subject: [PATCH 2/4] RANK_HCAS: a rank's own RoCE device names where a node
+ names them otherwise
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/config.sh | 1 +
+ scripts/start.sh  | 4 +++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/config.sh b/scripts/config.sh
+index 303c8f6..ca76cd5 100755
+--- a/scripts/config.sh
++++ b/scripts/config.sh
+@@ -56,6 +56,7 @@ COPIES="${COPIES:-1}"                         # 0: no prompt-copy (n-gram) draft
+ # --- NCCL over the CX7 link (as MiMo's recipe) -------------------------------------------------------------------
+ NCCL_IFNAME="${NCCL_IFNAME:-<netdev>}"
+ NCCL_HCAS="${NCCL_HCAS:-rocep1s0f0,roceP2p1s0f0}"
++RANK_HCAS="${RANK_HCAS:-}"                    # per rank, space-separated, "-" for NCCL_HCAS: for nodes whose RoCE devices are named otherwise (mlx5_0,...)
+ NCCL_GID="${NCCL_GID:-3}"
+ 
+ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+diff --git a/scripts/start.sh b/scripts/start.sh
+index 2c0992c..3fe3dea 100755
+--- a/scripts/start.sh
++++ b/scripts/start.sh
+@@ -49,10 +49,12 @@ if (( WORLD > 2 )) && [[ $ROCE == 1 ]]; then
+     log "no $BIN/lib/tp_mailbox.fatbin: NCCL carries every gather (scripts/zig_prepare.sh builds it)"
+   fi
+ fi
++read -ra RH <<< "$RANK_HCAS"
++hcas() { local h=${RH[$1]:--}; [[ $h == - ]] && h=$NCCL_HCAS; echo "$h"; } # RANK: its RoCE devices
+ run_args() { # RANK: every rank's container settings (NCCL over the CX7 RoCE link, as MiMo's recipe)
+   echo "--gpus all --ipc=host --network host --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1" \
+     "--user $(id -u):$(id -g) -e HOME=/tmp -v $MODEL_DIR:$MODEL_DIR:ro -v $D:$D:ro" \
+-    "-e NCCL_COMM_ID=$MASTER:$TP_PORT -e NCCL_SOCKET_IFNAME=$NCCL_IFNAME -e NCCL_IB_HCA=$NCCL_HCAS" \
++    "-e NCCL_COMM_ID=$MASTER:$TP_PORT -e NCCL_SOCKET_IFNAME=$NCCL_IFNAME -e NCCL_IB_HCA=$(hcas "$1")" \
+     "-e NCCL_IB_GID_INDEX=$NCCL_GID -e TF_ROCE_GID_INDEX=$NCCL_GID -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4" \
+     "-e TF_RICURSIVE_RANK=$1 -e TF_RICURSIVE_WORLD=$WORLD -e TF_RICURSIVE_CONTEXT=$CONTEXT -e TF_RICURSIVE_SLOTS=$STREAMS" \
+     "-e TF_RICURSIVE_GRAPHS=$GRAPHS -e TF_RICURSIVE_ROCE=$ROCE -e TENSORFOLD_MEMORY_RESERVE_GIB=$MEM_RESERVE_GIB $WIRE ${EXTRA_ENV:-}"
+-- 
+2.43.0
+

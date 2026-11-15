@@ -1,0 +1,162 @@
+From a028db87096ad85faedd607e32e4d4bff2241f91 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 06:25:39 +0000
+Subject: [PATCH] ricursive: prompt calls' layer tails in two halves, each
+ half's sum overlapped with the other's compute (same bits)
+
+At four ranks the row-scatter sums were 28% of a prompt's GPU time on rank 0, run after the compute they wait for.
+A prompt call of 256 rows or more now runs o_proj through post_ffn in two row halves; each half's sum goes to a
+second, highest-priority stream behind an event while the other half computes, so only down_proj's second-half sum
+is waited out. Each row runs the same kernels on the same inputs, so the bits stay (greedy goldens byte-identical to
+the one-pass build). TF_RICURSIVE_OVERLAP=0 runs one pass. Four GB10s: cold prefill 1,038-1,051 -> 1,172-1,175 tok/s
+at 7.6K tokens, 1,015 -> 1,114-1,118 at 30K.
+---
+ zig/src/families/ricursive/cuda_forward.zig | 14 +++-
+ zig/src/families/ricursive/cuda_overlap.zig | 75 +++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/families/ricursive/cuda_overlap.zig
+
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index 4a8f36364..c0a49761b 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -9,6 +9,7 @@ const Kernels = @import("cuda_kernels.zig").Kernels;
+ const kept = @import("cuda_kept.zig");
+ const Scatter = @import("cuda_scatter.zig").Scatter;
+ const Pfd = @import("cuda_pfd.zig").Pfd;
++const ovl = @import("cuda_overlap.zig");
+ 
+ const hd = config.head_dim;
+ const Tree = cuda.tree_attention.TreeAttention;
+@@ -115,7 +116,8 @@ pub const Model = struct {
+     k: Kernels,
+     group: ?cuda.tp_group.Group = null,
+     pfd: ?Pfd = null, // prompt rows' projections by pfdense (cuda_pfd.zig); null: the trellis kernel
+-    scatter: ?Scatter = null, // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
++    scatter: ?Scatter = null,
++    overlap: ?ovl.Overlap = null, // with the scatter: prompt calls' layer tails in two overlapped halves // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
+     caches: []Cache = &.{},
+     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+     // a rank's heads, key heads, FFN width and vocab share
+@@ -162,6 +164,8 @@ pub const Model = struct {
+             if (o.roce and world > 2) try roce_multi.open(gpa, io, d, &m.group.?, true);
+             const off = if (std.c.getenv("TF_RICURSIVE_SCATTER")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+             if (world > 2 and !off) m.scatter = try Scatter.init(d, max_rows, world, c.hidden);
++            const no_ovl = if (std.c.getenv("TF_RICURSIVE_OVERLAP")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++            if (m.scatter != null and !no_ovl) m.overlap = try ovl.Overlap.init(d);
+         }
+         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
+         m.dense = try cuda.exl3.Dense.load(d);
+@@ -289,6 +293,7 @@ pub const Model = struct {
+         m.norms.unload();
+         m.dense.unload();
+         m.w.deinit();
++        if (m.overlap) |*o| o.deinit();
+         if (m.scatter) |*x| x.deinit();
+         if (m.pfd) |*p| p.deinit();
+         if (m.group) |*g| g.close();
+@@ -435,7 +440,7 @@ pub const Model = struct {
+     }
+ 
+     /// A layer projection: a prompt call's by pfdense where it takes the weight, else the trellis kernel's.
+-    fn proj(m: *Model, hw: *const Header, w: cuda.exl3.Weight, x: u64, xd: cuda.exl3.DType, n: usize, y: u64, yd: cuda.exl3.DType) !void {
++    pub fn proj(m: *Model, hw: *const Header, w: cuda.exl3.Weight, x: u64, xd: cuda.exl3.DType, n: usize, y: u64, yd: cuda.exl3.DType) !void {
+         if (m.pfd) |*p| if (hw.op == @backingInt(Op.prompt) and Pfd.takes(w)) return p.run(m.stream, m.dense.lin.rot_in, w, x, xd, n, y, yd);
+         return m.dense.prompt(m.stream, w, x, xd, n, y, yd);
+     }
+@@ -584,6 +589,11 @@ pub const Model = struct {
+                 try m.tree.run(s, b.qo, b.ko, b.vo, rws, Tree.scratch(b.tree, n, m.hq, m.hk, ng, hd), b.q, n, m.hq, m.hk, hd, ng, c.scale());
+             }
+             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
++            if (m.overlap) |*o| if (hw.op == @backingInt(Op.prompt) and n >= ovl.min_rows and capture == null) {
++                try o.run(m, hw, l, n);
++                if (m.tapk) |*tk| for (m.taps[0..m.n_taps], 0..) |t, ti| if (t == li) try tk.taps(s, b.x, pos, slots, m.tap_ring, tap_rows, m.n_taps, ti, h, n);
++                continue;
++            };
+             if (world == 1) try m.proj(hw, l.o, b.gated, .f16, n, b.a, .f32) else {
+                 try m.proj(hw, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+                 try m.sumParts(b.a, n);
+diff --git a/zig/src/families/ricursive/cuda_overlap.zig b/zig/src/families/ricursive/cuda_overlap.zig
+new file mode 100644
+index 000000000..b00f9f8ed
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_overlap.zig
+@@ -0,0 +1,75 @@
++//! A prompt call's o_proj through post_ffn in two row halves at three ranks or more: each half's row-scatter sum
++//! (cuda_scatter.zig) runs on a second stream while the other half computes. The sum of o_proj's first half overlaps
++//! o_proj's second half, the second half's sum the first half's MLP, and down_proj's first-half sum the second half's
++//! MLP; only down_proj's second-half sum is waited out. Every row runs the same kernels on the same inputs as in one
++//! pass, so the bits do not change. TF_RICURSIVE_OVERLAP=0 runs one pass.
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// Rows a call takes before it splits: halves of at least one pfdense row tile (128 rows) each.
++pub const min_rows = 256;
++
++pub const Overlap = struct {
++    comm: cuda.Stream, // the sums' stream (highest priority, so its kernels take SMs as they free)
++    ready: [4]cuda.Event, // a half's partials written (o_proj 0, 1; down_proj 0, 1)
++    summed: [4]cuda.Event, // that half's sums in `a`
++
++    pub fn init(d: *const cuda.Driver) !Overlap {
++        var o: Overlap = .{ .comm = try cuda.Stream.initPriority(d, .highest), .ready = undefined, .summed = undefined };
++        for (&o.ready, &o.summed) |*r, *s| {
++            r.* = try cuda.Event.init(d, false);
++            s.* = try cuda.Event.init(d, false);
++        }
++        return o;
++    }
++
++    pub fn deinit(o: *Overlap) void {
++        for (&o.ready, &o.summed) |*r, *s| {
++            r.deinit();
++            s.deinit();
++        }
++        o.comm.deinit();
++    }
++
++    /// Model's layer tail for `n` prompt rows of layer `l` (gated rows in b.gated), as cuda_forward's single pass.
++    pub fn run(o: *Overlap, m: anytype, hw: anytype, l: anytype, n: usize) !void {
++        const s = m.stream;
++        const c = m.c;
++        const b = &m.b;
++        const h = c.hidden;
++        const qw = m.hq * @import("config.zig").head_dim;
++        const g = &m.group.?;
++        const x = &m.scatter.?;
++        const mid = std.mem.alignForward(usize, n / 2, 16);
++        const halves = [2][2]usize{ .{ 0, mid }, .{ mid, n } };
++        const mine = b.parts + m.rank() * n * h * 4; // this rank's partials, rows in order
++        const gu_up = b.gu + n * m.ff * 2;
++        for (halves, 0..) |r, i| {
++            try m.proj(hw, l.o, b.gated + r[0] * qw * 2, .f16, r[1] - r[0], mine + r[0] * h * 4, .f32);
++            try o.sumAfter(s, x, g, i, mine + r[0] * h * 4, r[1] - r[0], h, b.a + r[0] * h * 4);
++        }
++        for (halves, 0..) |r, i| {
++            const nh = r[1] - r[0];
++            try s.wait(o.summed[i]);
++            try m.k.normAdd(s, b.a + r[0] * h * 4, l.post_attn, b.x + r[0] * h * 4, nh, h, c.eps);
++            try m.norms.rms(s, b.x + r[0] * h * 4, .f32, l.pre_ffn, b.y + r[0] * h * 2, .f16, nh, h, c.eps);
++            try m.proj(hw, l.gate, b.y + r[0] * h * 2, .f16, nh, b.gu + r[0] * m.ff * 2, .f16);
++            try m.proj(hw, l.up, b.y + r[0] * h * 2, .f16, nh, gu_up + r[0] * m.ff * 2, .f16);
++            try m.k.swiglu(s, b.gu + r[0] * m.ff * 2, gu_up + r[0] * m.ff * 2, b.act + r[0] * m.ff * 2, nh * m.ff, c.clamp);
++            try m.proj(hw, l.down, b.act + r[0] * m.ff * 2, .f16, nh, mine + r[0] * h * 4, .f32);
++            try o.sumAfter(s, x, g, 2 + i, mine + r[0] * h * 4, nh, h, b.a + r[0] * h * 4);
++        }
++        for (halves, 0..) |r, i| {
++            try s.wait(o.summed[2 + i]);
++            try m.k.normAdd(s, b.a + r[0] * h * 4, l.post_ffn, b.x + r[0] * h * 4, r[1] - r[0], h, c.eps);
++        }
++    }
++
++    /// Slot `i`: the comm stream waits for what `s` queued so far, then sums `rows` rows into `into` there.
++    fn sumAfter(o: *Overlap, s: cuda.Stream, x: anytype, g: anytype, i: usize, partial: u64, rows: usize, width: usize, into: u64) !void {
++        try o.ready[i].record(s);
++        try o.comm.wait(o.ready[i]);
++        try x.sum(g, o.comm, partial, rows, width, into);
++        try o.summed[i].record(o.comm);
++    }
++};
+-- 
+2.43.0
+

@@ -1,8 +1,8 @@
 From 2dcf12c956f931027dadc734a7279777fefaadb5 Mon Sep 17 00:00:00 2001
 From: operator <225459632+operator@users.noreply.github.com>
 Date: Wed, 11 Nov 2026 16:10:11 +0000
-Subject: [PATCH] Four Sparks: WORKERS, patch 0010 (TP=4), the multirank wire's
- kernel
+Subject: [PATCH 1/4] Four Sparks: WORKERS, patch 0010 (TP=4), the multirank
+ wire's kernel
 
 WORKERS lists ranks 1.. in order (default WORKER, so two Sparks are unchanged); start.sh, stop.sh,
 prepare.sh, fetch_pack.sh and zig_prepare.sh run each step on every worker. patches-zig/0010 admits

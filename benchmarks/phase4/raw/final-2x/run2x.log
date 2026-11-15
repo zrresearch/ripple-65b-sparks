@@ -1,0 +1,60 @@
+[16:25:03] part A: Phase 2's configs + 1M retrieval (recipe start.sh)
+== plain: start 23:25:03
+[23:25:21] up after 20 s
+[23:25:21] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 55.44 GiB; 1 stream at once, 32.28 GiB each at a 1048576-token window, of 56.6 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[23:25:22] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[23:25:22] serving Ripple-65B-Preview at http://pny-head:8888/v1 on 2 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding 10.5 tok/s [512, 512]
+agent tool call 10.89 tok/s [512, 512]
+chat 9.92 tok/s [472, 472]
+-- vs Phase 2 (recipe):
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[23:31:57] stopped
+== drafted: start 23:31:57
+[23:32:25] up after 30 s
+[23:32:25] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 60.06 GiB; 1 stream at once, 32.44 GiB each at a 1048576-token window, of 51.2 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[23:32:27] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[23:32:27] serving Ripple-65B-Preview at http://pny-head:8888/v1 on 2 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding 36.28 tok/s [512, 512]
+agent tool call 31.66 tok/s [512, 512]
+chat 15.79 tok/s [472, 472]
+-- vs Phase 2 (recipe):
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[23:35:21] stopped
+== streams4: start 23:35:21
+[23:35:49] up after 30 s
+[23:35:49] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 59.64 GiB; 4 streams at once, 8.44 GiB each at a 262144-token window, of 51.9 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[23:35:50] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[23:35:50] serving Ripple-65B-Preview at http://pny-head:8888/v1 on 2 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+-- vs Phase 2 (recipe):
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[23:36:23] stopped
+== 1M retrieval: start 23:36:23
+[23:36:51] up after 30 s
+[23:36:51] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 60.06 GiB; 1 stream at once, 32.44 GiB each at a 1048576-token window, of 51.5 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[23:36:52] serving Ripple-65B-Preview at http://pny-head:8888/v1 on 2 Sparks
+{"prompt_tokens": 1015070, "first_token_s": 5438.1, "prompt_tok_s": 186.7, "completion_tokens": 65, "decode_tok_s": 6.52, "found": true, "answer": "7319-KESTREL-0442"}
+[01:07:44] stopped
+== P4 2x DONE 01:07:44
+[18:07:44] part B1: production 2x launcher (1 x 1M): SparkMan prefill
+[18:08:14] ln-mwccslpu-e84983 serving
+[18:16:14] res-prefill-2x.txt (bench-mwh4yfn1-87b2): completed None
+[18:16:19] part B2: 4 x 256K launcher: SparkMan code decode 1/2/4, prose 1/2/4
+[18:17:00] ln-mwh1954d-8991ba serving
+[18:18:00] res-decode-code-2x.txt (bench-mwh59oxy-5aa4): completed None
+1 at once:   16.0 tok/s aggregate,  16.0 per request, TTFT  557 ms
+2 at once:   30.1 tok/s aggregate,  15.4 per request, TTFT  793 ms
+4 at once:   51.5 tok/s aggregate,  13.2 per request, TTFT 1656 ms
+[18:28:44] P4 BENCH 2X DONE

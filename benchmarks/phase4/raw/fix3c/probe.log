@@ -1,0 +1,26 @@
+[15:36:02] Sparks free
+[15:36:33] [p0015] serving
+[p0015 prose] 4 at once:   75.5 tok/s aggregate,  19.4 per request, TTFT 1294 ms
+   drafted 2.21 per stream-round, accepted 41.1%, tokens per stream-round 1.91
+[p0015 prose] 2 at once:   45.8 tok/s aggregate,  23.6 per request, TTFT  429 ms
+   drafted 3.89 per stream-round, accepted 28.1%, tokens per stream-round 2.09
+[p0015 prose] 8 at once:  113.7 tok/s aggregate,  14.4 per request, TTFT 2260 ms
+   drafted 0.30 per stream-round, accepted 38.1%, tokens per stream-round 1.12
+[p0015] code 4/8/16 (bench-mwgzuq0j-38eb): 4: 155.0 / 8: 200.1 / 16: 228.0
+[15:47:19] [probe] serving
+[probe prose] 4 at once:   75.2 tok/s aggregate,  19.1 per request, TTFT 1309 ms
+   drafted 2.22 per stream-round, accepted 40.5%, tokens per stream-round 1.90
+[probe prose] 2 at once:   46.8 tok/s aggregate,  23.7 per request, TTFT  432 ms
+   drafted 3.56 per stream-round, accepted 30.7%, tokens per stream-round 2.10
+[probe prose] 8 at once:  111.4 tok/s aggregate,  14.3 per request, TTFT 2265 ms
+   drafted 0.33 per stream-round, accepted 40.7%, tokens per stream-round 1.14
+[probe] code 4/8/16 (bench-mwh08l82-e62d): 4: 154.2 / 8: 197.4 / 16: 230.4
+[15:58:16] [p0014] serving
+[p0014 prose] 4 at once:   74.7 tok/s aggregate,  19.3 per request, TTFT 1301 ms
+   drafted 2.25 per stream-round, accepted 40.4%, tokens per stream-round 1.91
+[p0014 prose] 2 at once:   48.4 tok/s aggregate,  24.6 per request, TTFT  430 ms
+   drafted 3.66 per stream-round, accepted 32.1%, tokens per stream-round 2.17
+[p0014 prose] 8 at once:   99.5 tok/s aggregate,  13.7 per request, TTFT 2281 ms
+   drafted 1.78 per stream-round, accepted 39.8%, tokens per stream-round 1.71
+[p0014] code 4/8/16 (bench-mwh0n39o-f5d8): 4: 156.7 / 8: 205.1 / 16: 219.6
+PROBE DONE

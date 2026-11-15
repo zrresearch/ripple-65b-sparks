@@ -1,0 +1,54 @@
+From 4f1dd4dc4ff6909d77aa1cbbf76595f978504bd7 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:55:53 +0000
+Subject: [PATCH] lanes: shared rounds price a timed drafter pass by the
+ streams that draft, not as overhead every option pays
+
+A drafter that reports hold_costs (ricursive) has its pass timed at load, and observeOverhead splits a round's time
+into a fixed share and the pass. shared_drafts.budgets still priced allocation with overheadMs (fixed plus the
+measured pass), so a round drafting none was charged a pass it would not run: at 16 sampled streams on four GB10s
+plain looked like 16 / (75 + 77) ms against drafting's 28 / 187, and every round drafted (0.150 tokens a ms
+measured, against 0.191 for plain rounds). With hold costs it now passes fixedMs and the hold table to
+allocateDrafts, which prices the pass by the drafting streams and the deepest chain (as rule.budgets and headMs
+already do). TF_HOLD_SHARED=0 restores the old pricing. Families without hold_costs are unchanged.
+Replies unchanged (goldens identical to the previous build). Four GB10s, 16 x 128K, same binary A/B:
+prose (T 0.7) 16 streams 143.4 -> 190.3 tok/s, 8 streams 103.2 -> 112.0; SparkMan code decode 16 streams
+221.3 / 237.2 -> 221.1 / 238.4 (unchanged).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/src/core/lanes/shared_drafts.zig | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/core/lanes/shared_drafts.zig b/zig/src/core/lanes/shared_drafts.zig
+index bf62869f4..c9d7ea877 100644
+--- a/zig/src/core/lanes/shared_drafts.zig
++++ b/zig/src/core/lanes/shared_drafts.zig
+@@ -56,13 +56,23 @@ pub fn budgets(e: *Engine, plans: []const win.Plan, heads: []const usize, out: [
+         @memset(out, 0);
+         return;
+     }
+-    const counts = try alloc.allocateDrafts(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(@intCast(live), sampled), e.rule.row_cost.capRows(live, sampled, @max(live, e.cfg.batch_rows)), .{ .row_ms = e.rule.row_cost.extraMs(live, sampled) });
++    // a drafter that timed its hold pass: the pass is priced by the streams that draft and their deepest chain, so a
++    // round drafting none pays none of it (the measured overhead's head share would charge plain rounds for it too)
++    const hold = if (holdShared()) e.rule.k.hold_costs else &.{};
++    const over = if (hold.len > 0) e.rule.fixedMs(@intCast(live), sampled) else e.rule.overheadMs(@intCast(live), sampled);
++    const counts = try alloc.allocateDrafts(a, fixed, probs, &e.cfg.shared_costs, over, e.rule.row_cost.capRows(live, sampled, @max(live, e.cfg.batch_rows)), .{ .row_ms = e.rule.row_cost.extraMs(live, sampled), .hold = hold });
+     for (heads, out) |i, *budget| {
+         budget.* = if (neural[i]) counts[i] else 0;
+     }
+     if (limits) |l| if (e.cfg.granted_depth) try payReserved(e, l.who, probs, heads, sampled, out);
+ }
+ 
++/// TF_HOLD_SHARED=0: shared rounds charge the drafter's measured pass to every option, drafting or not (as before).
++fn holdShared() bool {
++    const v = std.c.getenv("TF_HOLD_SHARED") orelse return true;
++    return v[0] != '0';
++}
++
+ // Copy lookups may advance a proposer's backoff; the reservation loop, not this depth cap, asks it once.
+ fn noCopy(_: *anyopaque, _: *const depth.Who) bool {
+     return false;
+-- 
+2.43.0
+

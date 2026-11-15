@@ -1,0 +1,17 @@
+[zig-out-ovl] serving; info: ricursive: target windows 1 / 2 / 16 rows 59.4 / 60.5 / 74.5 ms, a draft block 12.8 ms
+[zig-out-ovl] code decode (bench-mwg16t44-6f0b): 1: 70.1 / 2: 106.4 / 4: 125.7 / 8: 119.8 / 16: 148.9
+[zig-out-ovl] prose:
+1 at once:   26.9 tok/s aggregate,  26.9 per request, TTFT  377 ms
+2 at once:   47.9 tok/s aggregate,  24.4 per request, TTFT  550 ms
+4 at once:   70.7 tok/s aggregate,  18.9 per request, TTFT 1158 ms
+8 at once:   90.1 tok/s aggregate,  12.2 per request, TTFT 2240 ms
+16 at once:  170.0 tok/s aggregate,  10.6 per request, TTFT 3978 ms
+[zig-out-r64] serving; info: ricursive: target windows 1 / 2 / 16 / 32 / 64 rows 60.1 / 60.6 / 75.4 / 96.5 / 127.7 ms, a draft block 13.3 ms
+[zig-out-r64] code decode (bench-mwg1vtzi-0884): 1: 70.1 / 2: 105.9 / 4: 151.6 / 8: 189.2 / 16: 190.2
+[zig-out-r64] prose:
+1 at once:   26.1 tok/s aggregate,  26.1 per request, TTFT  387 ms
+2 at once:   47.1 tok/s aggregate,  23.6 per request, TTFT  561 ms
+4 at once:   72.1 tok/s aggregate,  19.2 per request, TTFT 1173 ms
+8 at once:   90.3 tok/s aggregate,  12.1 per request, TTFT 2158 ms
+16 at once:  116.0 tok/s aggregate,   7.8 per request, TTFT 3953 ms
+DEC DONE

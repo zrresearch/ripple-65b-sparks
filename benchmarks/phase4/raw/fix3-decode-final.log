@@ -1,0 +1,9 @@
+[zig-out-ab] serving; info: ricursive: target windows 1 / 2 / 16 / 32 / 64 rows 58.7 / 60.7 / 75.5 / 96.1 / 128.1 ms, a draft block 13.7 ms
+[zig-out-ab] code decode (bench-mwg6jh3z-2492): 1: 69.6 / 2: 107.4 / 4: 153.3 / 8: 194.0 / 16: 228.6
+[zig-out-ab] prose:
+1 at once:   26.2 tok/s aggregate,  26.2 per request, TTFT  387 ms
+2 at once:   46.6 tok/s aggregate,  23.7 per request, TTFT  551 ms
+4 at once:   74.8 tok/s aggregate,  19.1 per request, TTFT 1181 ms
+8 at once:  100.9 tok/s aggregate,  13.5 per request, TTFT 2131 ms
+16 at once:  146.3 tok/s aggregate,   9.8 per request, TTFT 3913 ms
+DEC DONE

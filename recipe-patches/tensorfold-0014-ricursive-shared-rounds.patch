@@ -1,0 +1,363 @@
+From 24698c7cfa0da76844981f1de5d5878537022b3a Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:24:06 +0000
+Subject: [PATCH] ricursive: shared rounds of 64 rows, one drafter pass a
+ round, its pass timed and priced, absorbs batched
+
+Several streams' decode stalled: a shared round held 16 rows over every stream (round_rows), so 8 streams verified
+at most one draft each and 16 none, though a GB10 window of 16 rows costs 75 ms against 59 for one. Now:
+- a round takes up to 64 rows over its streams (tree_rows; a stream's window stays 16), its widths timed at load
+  (24-64 rows), so the depth rule prices shared rounds by what they cost, not the widest window scaled;
+- the drafter holds every stream of a round in one pass (hold_streams 16: the lane core prices a batched head as one);
+- the drafter times that pass at load by streams and depth (1-16 streams: 14.6 / 22.1 / 54.6 ms at depth 15 on
+  four GB10s) and reports hold_costs; the lane core's shared budget (rule.budgets) and headMs price a timed pass by
+  its streams and deepest chain instead of step_ms times steps (no other family reports hold_costs);
+- a round's verified rows go to the drafter in one plan word and one pass (draft_absorbs): each stream's taps side
+  by side, one fc rank sum and one K/V matmul a layer, not two collectives and eleven GEMMs a stream.
+Replies are unchanged (greedy goldens byte-identical). Four GB10s, 16 x 128K, SparkMan code decode at 1/2/4/8/16
+streams 70.1/106.4/125.7/119.8/148.9 -> 69.6/107.4/153.3/194.0/228.6 tok/s; prose (T 0.7) 26.9/47.9/70.7/90.1/170.0 ->
+26.2/46.6/74.8/100.9/146.3.
+---
+ zig/src/core/lanes/allocate.zig             |   6 +-
+ zig/src/core/lanes/depth.zig                |  13 ++-
+ zig/src/families/ricursive/cuda_draft.zig   | 119 ++++++++++++++++++--
+ zig/src/families/ricursive/cuda_forward.zig |   8 +-
+ zig/src/families/ricursive/cuda_lanes.zig   |   6 +-
+ zig/src/families/ricursive/cuda_native.zig  |   4 +-
+ 6 files changed, 139 insertions(+), 17 deletions(-)
+
+diff --git a/zig/src/core/lanes/allocate.zig b/zig/src/core/lanes/allocate.zig
+index 3fea08998..ec922b99f 100644
+--- a/zig/src/core/lanes/allocate.zig
++++ b/zig/src/core/lanes/allocate.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const Allocator = std.mem.Allocator;
+ const Table = @import("table.zig").Table;
++const hold_price = @import("hold_price.zig");
+ 
+ /// A batched head's extra drafts cost the deepest stream's steps; FZ_PRICE_BATCHED=0 prices each stream's.
+ pub fn pricedBatched() bool {
+@@ -22,6 +23,7 @@ pub const HeadCost = struct {
+     batched: bool = false,
+     free_first: bool = false,
+     row_ms: f64 = 0.0, // what each row past a stream's first costs past the table on this machine
++    hold: []const hold_price.HoldCost = &.{}, // a drafter's own pass by the streams it drafts: priced instead of steps
+ };
+ 
+ /// allocate, each stream's drafts past its first costing one more head step.
+@@ -66,7 +68,9 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
+         deepest = @max(deepest, counts[s]);
+         expected += pick_p;
+         const steps: f64 = @floatFromInt(if (head.batched) deepest -| @intFromBool(head.free_first) else drafts - (if (head.free_first) firsts else 0));
+-        const now = rate(costs, timed, rows, expected, overhead_ms + head.step_ms * steps + head.row_ms * @as(f64, @floatFromInt(rows -| live)));
++        // a drafter that timed its pass prices it by the streams drafting and the deepest chain, not by steps
++        const head_ms = if (head.hold.len > 0) hold_price.holdMs(head.hold, @intCast(firsts), deepest) else head.step_ms * steps;
++        const now = rate(costs, timed, rows, expected, overhead_ms + head_ms + head.row_ms * @as(f64, @floatFromInt(rows -| live)));
+         if (now > best or (!timed and head.step_ms == 0)) {
+             best = now;
+             @memcpy(best_counts, counts);
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 2d04b218e..347c428f2 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -337,9 +337,9 @@ pub const Rule = struct {
+         const ones = try r.gpa.alloc(u32, whos.len);
+         defer r.gpa.free(ones);
+         @memset(ones, 1);
+-        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled) };
++        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled), .hold = r.k.hold_costs };
+         const counts = if (r.draft_step_ms != 0)
+-            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled) })
++            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled), .hold = r.k.hold_costs })
+         else
+             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
+         defer r.gpa.free(counts);
+@@ -401,6 +401,15 @@ pub const Rule = struct {
+ 
+     /// The modeled time of a shared round's head steps for the depths it drafted.
+     pub fn headMs(r: *const Rule, depths: []const i64) f64 {
++        if (r.k.hold_costs.len > 0) { // a timed pass: its streams and deepest chain, as allocateDrafts prices it
++            var streams: usize = 0;
++            var deep: i64 = 0;
++            for (depths) |d| if (d > 0) {
++                streams += 1;
++                deep = @max(deep, d);
++            };
++            return if (streams == 0) 0 else holdMs(r.k.hold_costs, streams, deep);
++        }
+         var steps: i64 = 0;
+         for (depths) |d| steps = if (r.batched_heads) @max(steps, d) else steps + d;
+         return r.mtp_step_ms * @as(f64, @floatFromInt(steps));
+diff --git a/zig/src/families/ricursive/cuda_draft.zig b/zig/src/families/ricursive/cuda_draft.zig
+index 280f55cd6..6f1728210 100644
+--- a/zig/src/families/ricursive/cuda_draft.zig
++++ b/zig/src/families/ricursive/cuda_draft.zig
+@@ -12,7 +12,7 @@ const Cost = lanes.config.Cost;
+ /// cuBLASLt's workspace for the drafter's matmuls.
+ const work_bytes = 32 << 20;
+ /// Streams one hold runs together (a round's others go in further holds), and the widest block.
+-const hold_streams = 4;
++const hold_streams = fwd.max_streams; // every stream of a shared round in one hold (the lane core prices a batched head as one pass)
+ const max_block = 16;
+ 
+ /// A stream's context: its layers' key and value rings over positions [begin, end), and the chain it holds.
+@@ -45,6 +45,8 @@ pub const Draft = struct {
+     step_ms: f64 = 1.0,
+     costs: [fwd.tree_rows]Cost = undefined,
+     n_costs: usize = 0,
++    holds: [10]lanes.hold_price.HoldCost = undefined, // the hold pass by streams (1 to 16) and depth (1, block - 1)
++    n_holds: usize = 0,
+ 
+     /// The drafter in `dir` over the target `m`, this rank's share; rank 0 first has rank 1 open its own.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, dir: []const u8) !*Draft {
+@@ -360,7 +362,9 @@ pub const Draft = struct {
+     pub fn time(d: *Draft) !void {
+         var toks: [fwd.tree_rows]u32 = undefined;
+         for (&toks, 0..) |*t, i| t.* = @intCast(1000 + i);
+-        for (1..fwd.tree_rows + 1) |w| {
++        const widths = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 40, 48, 56, 64 }; // to fwd.tree_rows: shared rounds priced by their own rows
++        comptime std.debug.assert(widths[widths.len - 1] == fwd.tree_rows);
++        for (widths, 0..) |w, wi| {
+             var best = std.math.inf(f64);
+             for (0..3) |_| {
+                 const t0 = std.Io.Clock.awake.now(d.io);
+@@ -368,9 +372,9 @@ pub const Draft = struct {
+                 try d.m.stream.synchronize();
+                 best = @min(best, ms(d.io, t0));
+             }
+-            d.costs[w - 1] = .{ .width = @intCast(w), .ms = best };
++            d.costs[wi] = .{ .width = @intCast(w), .ms = best };
+         }
+-        d.n_costs = fwd.tree_rows;
++        d.n_costs = widths.len;
+         const x = try d.create();
+         var best = std.math.inf(f64);
+         for (0..4) |_| {
+@@ -381,9 +385,42 @@ pub const Draft = struct {
+         }
+         try d.pool.append(d.gpa, x);
+         d.step_ms = best / @as(f64, @floatFromInt(d.c.block - 1));
++        try d.timeHolds();
+         // TF_RIPPLE_DRAFT_STEP_MS: the round loop's price of one more draft (a block costs the same at any depth)
+         if (std.c.getenv("TF_RIPPLE_DRAFT_STEP_MS")) |v| d.step_ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch d.step_ms;
+-        std.log.info("ricursive: target windows 1 / 2 / 16 rows {d:.1} / {d:.1} / {d:.1} ms, a draft block {d:.1} ms", .{ d.costs[0].ms, d.costs[1].ms, d.costs[15].ms, best });
++        std.log.info("ricursive: target windows 1 / 2 / 16 / 32 / 64 rows {d:.1} / {d:.1} / {d:.1} / {d:.1} / {d:.1} ms, a draft block {d:.1} ms", .{ d.costs[0].ms, d.costs[1].ms, d.costs[15].ms, d.costs[17].ms, d.costs[21].ms, best });
++    }
++
++    /// The hold pass of 1, 2, 4, 8 and 16 streams (as many as the slots allow), 1 and block - 1 drafts deep: what the
++    /// lane core charges a shared round for drafting (one pass takes every stream; its cost grows with them, barely
++    /// with depth), in place of step_ms times the depth.
++    fn timeHolds(d: *Draft) !void {
++        const most = @min(fwd.max_streams, d.m.slots);
++        var xs: [fwd.max_streams]*Ctx = undefined;
++        var got: usize = 0;
++        defer for (xs[0..got]) |x| d.pool.append(d.gpa, x) catch d.drop(x);
++        while (got < most) : (got += 1) xs[got] = d.pool.pop() orelse try d.create();
++        var items: [fwd.max_streams]dr.Hold = undefined;
++        d.n_holds = 0;
++        for ([_]usize{ 1, 2, 4, 8, 16 }) |k| {
++            if (k > most) break;
++            for ([_]u32{ 1, @intCast(d.c.block - 1) }) |depth| {
++                for (items[0..k], xs[0..k]) |*it, x| {
++                    it.* = .{ .stream = undefined, .pending = 1000, .position = 2, .depth = depth };
++                    x.* = .{ .ring = x.ring, .id = x.id, .end = 1 };
++                }
++                var best = std.math.inf(f64);
++                for (0..3) |_| {
++                    for (xs[0..k]) |x| x.* = .{ .ring = x.ring, .id = x.id, .end = 1 };
++                    const t0 = std.Io.Clock.awake.now(d.io);
++                    try d.hold(items[0..k], xs[0..k]);
++                    best = @min(best, ms(d.io, t0));
++                }
++                d.holds[d.n_holds] = .{ .streams = @intCast(k), .depth = depth, .ms = best };
++                d.n_holds += 1;
++            }
++        }
++        std.log.info("ricursive: a hold pass of 1 / 4 / {d} streams at depth {d}: {d:.1} / {d:.1} / {d:.1} ms", .{ d.holds[d.n_holds - 1].streams, d.c.block - 1, d.holds[1].ms, if (d.n_holds > 5) d.holds[5].ms else d.holds[d.n_holds - 1].ms, d.holds[d.n_holds - 1].ms });
+     }
+ 
+     fn ms(io: std.Io, t0: std.Io.Timestamp) f64 {
+@@ -407,7 +444,7 @@ pub const Draft = struct {
+ 
+     fn factsFn(p: *anyopaque) dr.Facts {
+         const d = cast(p);
+-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
++        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes(), .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .hold_costs = d.holds[0..d.n_holds] };
+     }
+ 
+     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
+@@ -422,6 +459,9 @@ pub const Draft = struct {
+     fn absorbFn(p: *anyopaque, items: []const dr.Absorb) anyerror!void {
+         const d = cast(p);
+         const most = d.c.ringRows() - d.c.block;
++        var many: [fwd.max_streams]Piece = undefined;
++        var k: usize = 0;
++        var total: u64 = 0;
+         for (items) |it| {
+             const x = d.streams.get(it.stream) orelse return error.UnknownStream;
+             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
+@@ -442,8 +482,62 @@ pub const Draft = struct {
+                 }
+             }
+             const row = fwd.tap_rows * d.c.n_taps * d.c.hidden * 2;
+-            try d.absorb(x, @intCast((it.features.buffer - d.m.tap_ring) / row), start, @intCast(n));
++            const slot: usize = @intCast((it.features.buffer - d.m.tap_ring) / row);
++            if (n == 0) continue;
++            // a round's verified rows (a few a stream): every stream in one pass below; a prompt's on its own
++            if (n <= fwd.window_max and k < fwd.max_streams and total + n <= fwd.max_rows) {
++                many[k] = .{ .x = x, .slot = slot, .start = start, .rows = @intCast(n) };
++                k += 1;
++                total += n;
++            } else try d.absorb(x, slot, start, @intCast(n));
++        }
++        if (k == 1) return d.absorb(many[0].x, many[0].slot, many[0].start, many[0].rows);
++        if (k > 1) try d.absorbBatch(many[0..k]);
++    }
++
++    pub const Piece = struct { x: *Ctx, slot: usize, start: u64, rows: usize };
++
++    /// Several streams' verified rows in one plan word and one pass: each stream's taps gathered side by side, then
++    /// fc (one rank sum), the norm and every layer's K and V over all their rows, each stream's into its own rings.
++    fn absorbBatch(d: *Draft, ps: []const Piece) !void {
++        const most = d.c.ringRows() - d.c.block;
++        var h: fwd.Header = .{ .op = @backingInt(fwd.Op.draft_absorbs), .ns = @intCast(ps.len) };
++        for (ps, 0..) |p, i| {
++            const x = p.x;
++            if (p.start < x.end) x.end = p.start;
++            if (p.start > x.end or x.begin > p.start) x.begin = p.start;
++            if (p.start + p.rows > x.begin + most) x.begin = p.start + p.rows - most;
++            h.streams[i] = .{ x.id, @intCast(p.slot), @intCast(p.start), @intCast(p.rows) };
++            h.pos[i] = @intCast(x.begin);
++        }
++        if (d.world > 1) try d.m.plan(&h);
++        try d.absorbMany(ps);
++    }
++
++    /// Every rank: absorbRows for several streams at once (their rows side by side in the pass buffers).
++    pub fn absorbMany(d: *Draft, ps: []const Piece) !void {
++        const c = d.c;
++        const s = d.m.stream;
++        const stride = c.n_taps * c.hidden;
++        const kc = stride / d.world;
++        var total: usize = 0;
++        for (ps) |p| {
++            try d.k.gather(s, d.m.tap_ring + p.slot * fwd.tap_rows * stride * 2, fwd.tap_rows, p.start, stride, d.rank * kc, kc, d.b.taps + total * kc * 2, p.rows);
++            total += p.rows;
++        }
++        try d.mmSum(d.b.taps, d.w.fc, d.b.th, total, c.hidden, kc);
++        try d.k.rms(s, d.b.th, d.w.hidden_norm, d.b.thn, c.hidden, c.eps, 0, 0, total);
++        for (d.w.layers[0..c.layers], 0..) |l, i| {
++            try d.mm(d.b.thn, l.k, d.b.ka, total, c.kvWidth(), c.hidden);
++            try d.mm(d.b.thn, l.v, d.b.va, total, c.kvWidth(), c.hidden);
++            var at: usize = 0;
++            for (ps) |p| {
++                const rk = d.ringK(p.x, i);
++                try d.k.kvPut(s, d.b.ka + at * c.kvWidth() * 4, d.b.va + at * c.kvWidth() * 4, l.k_norm, rk, rk + c.ringRows() * c.kvWidth() * 2, c, p.start, c.rope[i], p.rows);
++                at += p.rows;
++            }
+         }
++        for (ps) |p| p.x.end = p.start + p.rows;
+     }
+ 
+     fn holdFn(p: *anyopaque, items: []const dr.Hold) anyerror!void {
+@@ -487,6 +581,17 @@ pub fn follow(m: *fwd.Model, h: *const fwd.Header) anyerror!void {
+         x.begin = @intCast(h.b);
+         return d.absorbRows(x, @intCast(h.a), @intCast(h.p0), @intCast(h.n));
+     }
++    if (h.op == @backingInt(fwd.Op.draft_absorbs)) {
++        if (h.ns <= 0 or h.ns > fwd.max_streams) return error.RicursiveRows;
++        var ps: [fwd.max_streams]Draft.Piece = undefined;
++        for (ps[0..@intCast(h.ns)], 0..) |*q, i| {
++            const e = h.streams[i];
++            const x = try d.ctxOf(e[0]);
++            x.begin = @intCast(h.pos[i]);
++            q.* = .{ .x = x, .slot = @intCast(e[1]), .start = @intCast(e[2]), .rows = @intCast(e[3]) };
++        }
++        return d.absorbMany(ps[0..@intCast(h.ns)]);
++    }
+     if (h.ns <= 0 or h.ns > hold_streams) return error.RicursiveRows;
+     var ctxs: [hold_streams]*Ctx = undefined;
+     for (ctxs[0..@intCast(h.ns)], 0..) |*x, i| x.* = try d.ctxOf(h.streams[i][0]);
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index c0a49761b..e9f819de8 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -17,7 +17,9 @@ const max_depth = cuda.tree_attention.max_depth;
+ /// Rows a forward call runs at once: the EXL3 linears' widest call, and tree attention's longest path.
+ pub const max_rows = 1024;
+ /// Rows a tree attention call takes when prompt chunks go to the prompt rows (decode rows only; sizes its scratch).
+-pub const tree_rows = 16;
++pub const tree_rows = 64;
++/// A stream's verify window at most (the drafter's block): the rows a round gives a stream to absorb.
++pub const window_max = 16; // a decode call's rows over every stream (a stream's own window: cuda_lanes.window_rows)
+ /// Streams one decode call holds (each its own slot's rows).
+ pub const max_streams = 16;
+ /// Tap rows a slot's ring holds for a drafter (a prompt chunk and a window, read right after the call that wrote them).
+@@ -72,7 +74,7 @@ pub const Options = struct {
+ };
+ 
+ /// Plan ops: stop, decode rows, a prompt chunk, kept states (save, restore, drop, row copy), hello, a drafter's calls.
+-pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7, taps = 8, draft_open = 9, draft_absorb = 10, draft_hold = 11 };
++pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7, taps = 8, draft_open = 9, draft_absorb = 10, draft_hold = 11, draft_absorbs = 12 };
+ 
+ /// Rank 0's plan word before each call: op, rows, p0, head rows, slot, a, b; rows' ids/positions/slots; streams.
+ pub const Header = extern struct {
+@@ -434,7 +436,7 @@ pub const Model = struct {
+                     for (t[0..@intCast(@min(@max(h.n, 0), 8))], 0..) |*x, i| x.* = @intCast(h.ids[i]);
+                     try m.setTaps(t[0..@intCast(@min(@max(h.n, 0), 8))]);
+                 },
+-                .draft_open, .draft_absorb, .draft_hold => try (m.draft_hook orelse return error.RicursiveNoDrafter)(m, &h),
++                .draft_open, .draft_absorb, .draft_hold, .draft_absorbs => try (m.draft_hook orelse return error.RicursiveNoDrafter)(m, &h),
+             }
+         }
+     }
+diff --git a/zig/src/families/ricursive/cuda_lanes.zig b/zig/src/families/ricursive/cuda_lanes.zig
+index 6b618f2fa..2e52b21f5 100644
+--- a/zig/src/families/ricursive/cuda_lanes.zig
++++ b/zig/src/families/ricursive/cuda_lanes.zig
+@@ -11,7 +11,9 @@ const Stream = lanes.Stream;
+ /// Prompt rows a step takes: the forward's chunk, cut at the prompt cache's marks.
+ pub const prompt_rows: u32 = fwd.max_rows;
+ /// Rows a round takes over every stream (tree attention's decode scratch), and the widest window a stream verifies.
+-pub const round_rows: u32 = fwd.tree_rows;
++pub const round_rows: u32 = fwd.tree_rows; // a shared round's rows over every stream
++/// The widest window a stream verifies (the drafter's block) and the one-token steps' exact width.
++pub const window_rows: u32 = 16;
+ /// Drawn tokens a handle names (a ring; read before the round loop could wrap it).
+ const ring = 1024;
+ 
+@@ -113,7 +115,7 @@ pub const Ripple = struct {
+ 
+     /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
+     pub fn facts(x: *const Ripple) lanes.Model {
+-        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = round_rows, .copy_drafts = x.copies, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)) };
++        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = window_rows, .copy_drafts = x.copies, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, fwd.max_streams)) };
+     }
+ 
+     fn self(ptr: *anyopaque) *Ripple {
+diff --git a/zig/src/families/ricursive/cuda_native.zig b/zig/src/families/ricursive/cuda_native.zig
+index 10c6f1aae..69f6e19a6 100644
+--- a/zig/src/families/ricursive/cuda_native.zig
++++ b/zig/src/families/ricursive/cuda_native.zig
+@@ -19,7 +19,7 @@ pub const snap_lookahead: u32 = 0;
+ pub const takes_drafter = true;
+ pub const explains_open = true;
+ /// A request's verify reserve past its prompt and reply.
+-pub const window_rows: u32 = rl.round_rows;
++pub const window_rows: u32 = rl.window_rows;
+ pub const weightShare = family.weightShare;
+ 
+ pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+@@ -88,7 +88,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     return .{
+         .backend = own.r.backend(),
+         .facts = own.r.facts(),
+-        .rows = rl.round_rows,
++        .rows = rl.window_rows,
+         .stream_bytes = per,
+         .free_streams = @intCast(slots),
+         .ctx = own,
+-- 
+2.43.0
+

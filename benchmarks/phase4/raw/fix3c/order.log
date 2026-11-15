@@ -1,0 +1,7 @@
+[16:09:31] [p0015] serving
+[p0015] code (bench-mwh0pqw2-f1a3): 1: 66.6 / 2: 109.6 / 4: 154.8 / 8: 200.1 / 16: 226.5
+[p0015 prose] 1 at once:   26.9 tok/s aggregate,  26.9 per request, TTFT  384 ms
+[p0015 prose] 2 at once:   45.8 tok/s aggregate,  23.9 per request, TTFT  554 ms
+[p0015 prose] 4 at once:   74.5 tok/s aggregate,  19.3 per request, TTFT 1154 ms
+[p0015 prose] 4 at once:   74.9 tok/s aggregate,  19.5 per request, TTFT  902 ms
+[p0015 prose] 4 at once:   72.8 tok/s aggregate,  19.1 per request, TTFT 1164 ms

@@ -1,0 +1,266 @@
+From 5e50da050ae3b0c5ec1998a150b9199fc5d37119 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 06:11:43 +0000
+Subject: [PATCH] ricursive: prompt projections by pfdense, prompt chunks of
+ 1,024 rows
+
+Prompt rows ran the EXL3 trellis kernel in 128-row blocks, decoding every rank's weights again each block (~30 TFLOPS
+on a GB10 at any chunk). pfdense (exl3_block/pfdense.cuh, DeepSeek-V4.1's fused prefill GEMM; built here for K2 10,
+the stored layout, as ricursive_pfd) decodes the trellis inside a tensor-core GEMM after exl3's rot_in: 39 TFLOPS on
+Ripple's four-rank shapes at 128 rows, 61-68 from 512. Prompt chunks grow to 1,024 rows (max_rows; the tap ring keeps a
+chunk plus 128). Decode rows keep the trellis kernel. TF_RICURSIVE_PFD=0 keeps it for prompts too (then every greedy
+golden is byte-identical to the four-rank build, and 16K WikiText-2 NLL bit-identical to 128-row chunks).
+
+pfdense does not add in the trellis kernel's order: on 16,384 WikiText-2 test tokens, one GB10, perplexity 6.9793 ->
+6.9802 (+0.013%), top-1 agreement 99.66%. Four GB10s with patch 0011: cold prefill 641 -> 1,051 tok/s at 7.6K tokens,
+610 -> 1,015 at 30K.
+---
+ zig/build/cuda_kernels.zig                  |  1 +
+ zig/kernels/cuda/ricursive_pfd.cu           |  6 ++
+ zig/src/cuda/kernels.zig                    |  1 +
+ zig/src/families/ricursive/cuda_forward.zig | 35 +++++---
+ zig/src/families/ricursive/cuda_pfd.zig     | 90 +++++++++++++++++++++
+ 5 files changed, 121 insertions(+), 12 deletions(-)
+ create mode 100644 zig/kernels/cuda/ricursive_pfd.cu
+ create mode 100644 zig/src/families/ricursive/cuda_pfd.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index bd25d7162..f85bd89a4 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -113,6 +113,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "moss_image", .flags = glue }, // ours: MOSS-Image's modulated norm, q/k rotary, situ, gated add
+     .{ .name = "ricursive", .flags = glue }, // ours: Ripple's embed scale, value residual, gate, clamped SwiGLU, post-norms
+     .{ .name = "ricursive_draft", .flags = &.{"-O3"} }, // ours: Ripple's DFlash2 drafter glue (taps, convolutions, attention)
++    .{ .name = "ricursive_pfd", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Ripple's prompt projections by pfdense (exl3_block)
+     .{ .name = "tree_round", .flags = &.{"-O3"} }, // ours: verified tree rounds for every family (cuda/tree_round.zig)
+     .{ .name = "act_rows", .flags = &.{"-O3"} }, // ours: SwiGLU, output gates, group sums (cuda/act_rows.zig)
+     .{ .name = "gdn_prep", .flags = &.{"-O3"} }, // ours: Gated DeltaNet conv, norms, g and beta (cuda/gdn_prep.zig)
+diff --git a/zig/kernels/cuda/ricursive_pfd.cu b/zig/kernels/cuda/ricursive_pfd.cu
+new file mode 100644
+index 000000000..23288df6b
+--- /dev/null
++++ b/zig/kernels/cuda/ricursive_pfd.cu
+@@ -0,0 +1,6 @@
++// ours: Ripple's prompt projections by pfdense (exl3_block/pfdense.cuh, DeepSeek-V4.1's fused prefill GEMM) at K2 = 10
++// (the 5.0 bpw packs, mul1), the stored trellis layout: pfdense_args.h configurations 0 and 5 (cuda_pfd.zig).
++#include "exl3_block/pfdense.cuh"
++
++template __global__ void dsv41_pfd::pfd_kernel<10, false, dsv41_pfd::Cfg<128, 2, 4, 2, 3>>(const dsv41_pfd::Args);
++template __global__ void dsv41_pfd::pfd_kernel<10, false, dsv41_pfd::Cfg<128, 2, 4, 2, 2>>(const dsv41_pfd::Args);
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index dd7dfd6fe..edfa06904 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -40,6 +40,7 @@ pub const vit: []const u8 = if (available) &Blob("fatbin_vit").bytes else &.{};
+ pub const moss_image: []const u8 = if (available) &Blob("fatbin_moss_image").bytes else &.{};
+ pub const ricursive: []const u8 = if (available) &Blob("fatbin_ricursive").bytes else &.{};
+ pub const ricursive_draft: []const u8 = if (available) &Blob("fatbin_ricursive_draft").bytes else &.{};
++pub const ricursive_pfd: []const u8 = if (available) &Blob("fatbin_ricursive_pfd").bytes else &.{};
+ pub const scan_rows: []const u8 = if (available) &Blob("fatbin_scan_rows").bytes else &.{};
+ pub const nemotron_ops: []const u8 = if (available) &Blob("fatbin_nemotron_ops").bytes else &.{};
+ pub const lane_gemv: []const u8 = if (available) &Blob("fatbin_lane_gemv").bytes else &.{};
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index f91d7f94f..4a8f36364 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -8,18 +8,19 @@ const weights = @import("cuda_weights.zig");
+ const Kernels = @import("cuda_kernels.zig").Kernels;
+ const kept = @import("cuda_kept.zig");
+ const Scatter = @import("cuda_scatter.zig").Scatter;
++const Pfd = @import("cuda_pfd.zig").Pfd;
+ 
+ const hd = config.head_dim;
+ const Tree = cuda.tree_attention.TreeAttention;
+ const max_depth = cuda.tree_attention.max_depth;
+ /// Rows a forward call runs at once: the EXL3 linears' widest call, and tree attention's longest path.
+-pub const max_rows = 128;
++pub const max_rows = 1024;
+ /// Rows a tree attention call takes when prompt chunks go to the prompt rows (decode rows only; sizes its scratch).
+ pub const tree_rows = 16;
+ /// Streams one decode call holds (each its own slot's rows).
+ pub const max_streams = 16;
+ /// Tap rows a slot's ring holds for a drafter (a prompt chunk and a window, read right after the call that wrote them).
+-pub const tap_rows = 256;
++pub const tap_rows = max_rows + 128;
+ /// Query heads a key head in the padded prompt layout (head dim 128 prompt rows take 4 or 8 a block).
+ const pad_group = 12;
+ 
+@@ -113,6 +114,7 @@ pub const Model = struct {
+     tree: Tree,
+     k: Kernels,
+     group: ?cuda.tp_group.Group = null,
++    pfd: ?Pfd = null, // prompt rows' projections by pfdense (cuda_pfd.zig); null: the trellis kernel
+     scatter: ?Scatter = null, // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
+     caches: []Cache = &.{},
+     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+@@ -163,6 +165,8 @@ pub const Model = struct {
+         }
+         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
+         m.dense = try cuda.exl3.Dense.load(d);
++        const no_pfd = if (std.c.getenv("TF_RICURSIVE_PFD")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++        if (!no_pfd) m.pfd = try Pfd.load(d, max_rows, @max(c.hidden, @max(m.hq * hd, m.ff)));
+         m.norms = try cuda.norms.Norms.load(d);
+         m.qk = try cuda.qk_rows.QkRows.load(d);
+         m.attn = try cuda.window_attention.WindowAttention.load(d);
+@@ -286,6 +290,7 @@ pub const Model = struct {
+         m.dense.unload();
+         m.w.deinit();
+         if (m.scatter) |*x| x.deinit();
++        if (m.pfd) |*p| p.deinit();
+         if (m.group) |*g| g.close();
+         m.stream.deinit();
+         m.gpa.destroy(m);
+@@ -429,6 +434,12 @@ pub const Model = struct {
+         }
+     }
+ 
++    /// A layer projection: a prompt call's by pfdense where it takes the weight, else the trellis kernel's.
++    fn proj(m: *Model, hw: *const Header, w: cuda.exl3.Weight, x: u64, xd: cuda.exl3.DType, n: usize, y: u64, yd: cuda.exl3.DType) !void {
++        if (m.pfd) |*p| if (hw.op == @backingInt(Op.prompt) and Pfd.takes(w)) return p.run(m.stream, m.dense.lin.rot_in, w, x, xd, n, y, yd);
++        return m.dense.prompt(m.stream, w, x, xd, n, y, yd);
++    }
++
+     /// n rows of o_proj or down_proj partials (parts + rank * n rows) summed over the ranks into `into`.
+     fn sumParts(m: *Model, into: u64, n: usize) !void {
+         const h = m.c.hidden;
+@@ -549,11 +560,11 @@ pub const Model = struct {
+             const kc = ca.kv.ptr;
+             const vc = ca.kv.ptr + m.slots * ca.ring * kw * 2;
+             try m.norms.rms(s, b.x, .f32, l.input_norm, b.y, .f16, n, h, c.eps);
+-            try m.dense.prompt(s, l.q, b.y, .f16, n, b.q, .bf16);
+-            try m.dense.prompt(s, l.k, b.y, .f16, n, b.k, .bf16);
+-            try m.dense.prompt(s, l.g, b.y, .f16, n, b.g, .f16);
++            try m.proj(hw, l.q, b.y, .f16, n, b.q, .bf16);
++            try m.proj(hw, l.k, b.y, .f16, n, b.k, .bf16);
++            try m.proj(hw, l.g, b.y, .f16, n, b.g, .f16);
+             try m.k.lerp(s, b.seed, b.y, b.vin, n * h, l.blend); // only V sees the value residual
+-            try m.dense.prompt(s, l.v, b.vin, .f16, n, b.v, .bf16);
++            try m.proj(hw, l.v, b.vin, .f16, n, b.v, .bf16);
+             const src: cuda.qk_rows.Src = .{ .q = b.q, .q_ld = @intCast(qw), .q_hs = hd, .k = b.k, .k_ld = @intCast(kw), .k_hs = hd, .v = b.v, .v_ld = @intCast(kw), .v_hs = hd };
+             const shape: cuda.qk_rows.Shape = if (l.global) .{ .norms = l.qk_norm, .eps = c.eps } else .{ .norms = l.qk_norm, .inv = b.inv, .rot = hd, .eps = c.eps };
+             try m.qk.rowsFrom(s, src, .{ .h = m.hq, .hk = m.hk, .dim = hd }, shape, pos, slots, .{ .q = b.qo, .k = b.ko, .v = b.vo, .kc = kc, .vc = vc, .len = ca.ring }, n);
+@@ -573,18 +584,18 @@ pub const Model = struct {
+                 try m.tree.run(s, b.qo, b.ko, b.vo, rws, Tree.scratch(b.tree, n, m.hq, m.hk, ng, hd), b.q, n, m.hq, m.hk, hd, ng, c.scale());
+             }
+             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
+-            if (world == 1) try m.dense.prompt(s, l.o, b.gated, .f16, n, b.a, .f32) else {
+-                try m.dense.prompt(s, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++            if (world == 1) try m.proj(hw, l.o, b.gated, .f16, n, b.a, .f32) else {
++                try m.proj(hw, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+                 try m.sumParts(b.a, n);
+             }
+             try m.k.normAdd(s, b.a, l.post_attn, b.x, n, h, c.eps);
+             try m.norms.rms(s, b.x, .f32, l.pre_ffn, b.y, .f16, n, h, c.eps);
+             const gu_up = b.gu + n * m.ff * 2;
+-            try m.dense.prompt(s, l.gate, b.y, .f16, n, b.gu, .f16);
+-            try m.dense.prompt(s, l.up, b.y, .f16, n, gu_up, .f16);
++            try m.proj(hw, l.gate, b.y, .f16, n, b.gu, .f16);
++            try m.proj(hw, l.up, b.y, .f16, n, gu_up, .f16);
+             try m.k.swiglu(s, b.gu, gu_up, b.act, n * m.ff, c.clamp);
+-            if (world == 1) try m.dense.prompt(s, l.down, b.act, .f16, n, b.a, .f32) else {
+-                try m.dense.prompt(s, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++            if (world == 1) try m.proj(hw, l.down, b.act, .f16, n, b.a, .f32) else {
++                try m.proj(hw, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+                 try m.sumParts(b.a, n);
+             }
+             try m.k.normAdd(s, b.a, l.post_ffn, b.x, n, h, c.eps);
+diff --git a/zig/src/families/ricursive/cuda_pfd.zig b/zig/src/families/ricursive/cuda_pfd.zig
+new file mode 100644
+index 000000000..c3c4207e2
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_pfd.zig
+@@ -0,0 +1,90 @@
++//! Prompt rows' projections by pfdense (exl3_block/pfdense.cuh, DeepSeek-V4.1's fused prefill GEMM): exl3's own rot_in,
++//! then a tensor-core GEMM that decodes the trellis inside it, with the output Hadamard and svh in its epilogue. On a
++//! GB10 at a four-rank cut it runs Ripple's projections at 39 TFLOPS at 128 rows and 61-68 from 512 (the trellis
++//! kernel: 30), but not in the trellis kernel's order, so prompt rows no longer give decode rows' bits.
++//! TF_RICURSIVE_PFD=0 keeps the trellis kernel for prompts.
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// pfdense_args.h (BM, WM, WN, KS, NST) of the two configurations ricursive_pfd.cu builds (ids 0 and 5 there).
++const cfgs = [_][5]u32{ .{ 128, 2, 4, 2, 3 }, .{ 128, 2, 4, 2, 2 } };
++const use = 1; // id 5: the fastest at 128, 512 and 2048 rows of Ripple's shapes, level with id 0 at 1024 and 4096
++const k2 = 10;
++
++/// dsv41_pfd::Args.
++const Args = extern struct {
++    xh: u64,
++    T: u64,
++    stride_k: i64,
++    stride_nb: i64,
++    svh: u64,
++    bias: u64 = 0,
++    out: u64,
++    o_stride: i64,
++    M: c_int,
++    K: c_int,
++    N: c_int,
++    group: c_int = 8,
++    out_type: c_int,
++};
++
++comptime {
++    std.debug.assert(@offsetOf(Args, "M") == 64 and @sizeOf(Args) == 88);
++}
++
++/// Lay<K2, LANES, Cfg>::SMEM.
++fn smem(c: [5]u32) u32 {
++    const bm, const wm, _, const ks, const nst = c;
++    const a_bytes = bm * (16 * ks) * 2;
++    const w_bytes = ks * 8 * (4 * k2) * 4;
++    const main = nst * (a_bytes + w_bytes) + 2 * (ks * 8 * 32 * 16);
++    return @max(main, (bm / wm) * 128 * 2 * 2);
++}
++
++fn symbol(comptime c: [5]u32) [:0]const u8 {
++    return std.fmt.comptimePrint("_ZN9dsv41_pfd10pfd_kernelILi{d}ELb0ENS_3CfgILi{d}ELi{d}ELi{d}ELi{d}ELi{d}EEEEEvNS_4ArgsE", .{ k2, c[0], c[1], c[2], c[3], c[4] });
++}
++
++pub const Pfd = struct {
++    mod: cuda.Module,
++    gemm: cuda.Function,
++    xh: cuda.DeviceBuffer, // the rotated fp16 inputs, `rows` rows of the widest K
++
++    pub fn load(d: *const cuda.Driver, rows: usize, k_max: usize) !Pfd {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var mod = try cuda.Module.load(d, cuda.kernels.ricursive_pfd);
++        errdefer mod.unload();
++        const f = try mod.function(symbol(cfgs[use]));
++        try f.allowDynamicShared(smem(cfgs[use]));
++        return .{ .mod = mod, .gemm = f, .xh = try cuda.DeviceBuffer.alloc(d, rows * k_max * 2) };
++    }
++
++    pub fn deinit(p: *Pfd) void {
++        p.xh.free();
++        p.mod.unload();
++    }
++
++    /// Whether pfdense takes `w`: 5.0 bpw mul1 trellis words in the stored layout, no bias.
++    pub fn takes(w: cuda.exl3.Weight) bool {
++        const st = cuda.exl3.strides(w.k, w.n, w.halves, false);
++        return w.halves == k2 and w.codebook == .mul1 and w.bias == 0 and w.stride_k == st.k and w.stride_nb == st.nb and w.k % 128 == 0 and w.n % 128 == 0;
++    }
++
++    /// y [rows, n] (y_dtype) = x [rows, k] (x_dtype) through `w`, on `s`; `rot` is exl3.Linear's tf_exl3_rot_in.
++    pub fn run(p: *const Pfd, s: cuda.Stream, rot: cuda.Function, w: cuda.exl3.Weight, x: u64, x_dtype: cuda.exl3.DType, rows: usize, y: u64, y_dtype: cuda.exl3.DType) !void {
++        var r: cuda.Args = .{};
++        r.add(x);
++        r.add(w.suh);
++        r.add(p.xh.ptr);
++        r.add(@as(i32, @backingInt(x_dtype)));
++        r.add(@as(i32, @intCast(rows)));
++        r.add(@as(i32, @intCast(w.k)));
++        try cuda.launch.launch(rot, .{ .grid = .{ .x = @intCast((w.k / 128 + 3) / 4), .y = @intCast(rows) }, .block = .{ .x = 128 } }, s, &r);
++        const a: Args = .{ .xh = p.xh.ptr, .T = w.trellis, .stride_k = @intCast(w.stride_k), .stride_nb = @intCast(w.stride_nb), .svh = w.svh, .out = y, .o_stride = @intCast(w.n), .M = @intCast(rows), .K = @intCast(w.k), .N = @intCast(w.n), .out_type = @backingInt(y_dtype) };
++        var g: cuda.Args = .{};
++        g.add(a);
++        const bm = cfgs[use][0];
++        const threads = cfgs[use][1] * cfgs[use][2] * 32;
++        try cuda.launch.launch(p.gemm, .{ .grid = .{ .x = @intCast(((rows + bm - 1) / bm) * (w.n / 128)) }, .block = .{ .x = threads }, .shared = smem(cfgs[use]) }, s, &g);
++    }
++};
+-- 
+2.43.0
+

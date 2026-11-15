@@ -1,0 +1,40 @@
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+50.5,7296399456,11520,633368.0,401600.0,75488,2268576,542773.9,"void dsv41_pfd::pfd_kernel<(int)10, (bool)0, dsv41_pfd::Cfg<(int)128, (int)2, (int)4, (int)2, (int)2>>(dsv41_pfd::Args)"
+27.8,4018520832,5120,784867.3,721616.0,163584,2746464,315811.9,ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)
+4.3,621744800,11524,53952.2,43104.0,1056,220800,42825.2,tf_exl3_rot_in
+4.2,609493568,1152,529074.3,660000.0,15488,945856,226442.7,tf_window_decode_tc
+3.7,532094272,2880,184755.0,221376.0,3232,338944,76236.7,tf_ripple_norm_add
+2.1,307976512,1440,213872.6,254976.0,928,411712,89931.8,tf_ripple_swiglu
+1.8,256792384,288,891640.2,914384.0,185568,1759776,463767.2,"void tf_window_prompt::wattn_kernel<(int)128, (int)8, (int)4, (int)8>(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int, int, float, int, int)"
+1.7,251488704,2882,87261.9,104480.0,2144,173920,37990.1,tf_rms_rows
+1.2,168011680,1440,116674.8,138976.0,1152,241536,49975.2,tf_ripple_lerp
+1.0,141746240,2560,55369.6,56192.0,14144,134368,16824.4,tf_rank_sum
+0.5,70675776,1440,49080.4,57536.0,3744,119776,19390.8,tf_qk_rows_w
+0.4,59515136,1440,41330.0,46944.0,1056,145792,20340.6,tf_ripple_gate
+0.2,30794464,328,93885.6,63312.0,12160,538976,101507.5,tp_roce_multi
+0.2,22767424,80,284592.8,289488.0,74592,719104,154516.3,ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
+0.1,13316928,92,144749.2,110832.0,13408,482208,170132.6,void cutlass::Kernel2<cutlass_80_wmma_tensorop_s161616gemm_bf16_16x16_128x2_tn_align8>(T1::Params)
+0.1,11908960,576,20675.3,22000.0,928,71808,9168.4,tf_ripple_heads
+0.1,9063776,90,100708.6,117216.0,4480,161984,44288.1,tf_ripd_taps
+0.0,6222304,22,282832.0,278672.0,112576,472384,165305.0,void cutlass::Kernel2<cutlass_80_wmma_tensorop_s161616gemm_bf16_16x16_128x1_tn_align8>(T1::Params)
+0.0,5803264,16,362704.0,364432.0,323744,395456,14948.2,nvjet_sm121_tss_mma_128x160x64_2_64x40x64_tmaAB_alignCD4_bz_TNNN
+0.0,4070944,160,25443.4,21040.0,16768,96384,13812.5,nvjet_sm121_tss_mma_32x32x128_6_16x16x128_tmaAB_alignCD4_bz_TNNN
+0.0,2345984,4,586496.0,586224.0,578752,594784,7723.7,tf_exl3_linear_16_2_8
+0.0,2115200,18,117511.1,137200.0,9408,162080,49419.5,tf_ripple_embed
+0.0,974016,360,2705.6,1760.0,1216,68416,5146.7,tf_ripple_rank_sum
+0.0,706752,22,32125.1,7104.0,6304,266208,75672.2,"std::enable_if<!T7, void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, float, float, float, (bool)0, (bool)1, (bool)1, (bool)0, (int)7, (bool)0, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>, float>>(T13)"
+0.0,596256,10,59625.6,59408.0,58752,60896,763.8,tf_ripd_attn
+0.0,550464,100,5504.6,4944.0,2400,25280,3399.8,tf_ripd_kv_put
+0.0,392640,20,19632.0,22016.0,6624,28192,6282.0,tf_ripd_gather
+0.0,378272,44,8597.1,5408.0,3744,17472,5388.6,tf_ripd_rms
+0.0,107136,20,5356.8,5280.0,5184,6048,237.7,tf_ripd_conv_out
+0.0,96896,2,48448.0,48448.0,48320,48576,181.0,tf_argmax_rows_i32_kernel
+0.0,78656,42,1872.8,1792.0,1216,3616,724.7,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, float, float, float, (bool)0, float, float, float, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
+0.0,63488,20,3174.4,2976.0,2752,5184,673.9,tf_ripd_conv_in
+0.0,58016,2,29008.0,29008.0,28928,29088,113.1,tf_ripd_topk
+0.0,52288,10,5228.8,5184.0,4992,5664,227.9,tf_ripd_silu
+0.0,39456,20,1972.8,1712.0,1216,2560,466.2,tf_ripd_heads
+0.0,35136,10,3513.6,3200.0,3008,4832,698.6,tf_ripd_merge
+0.0,31904,2,15952.0,15952.0,15936,15968,22.6,tf_ripd_embed
+0.0,9344,10,934.4,912.0,864,1056,78.1,tf_ripd_f2b
+

@@ -1,0 +1,30 @@
+completed None
+{
+ "kind": "decode",
+ "levels": [
+  {
+   "concurrency": 1,
+   "aggregateTokS": 45.256673511293634,
+   "perStreamTokS": 45.256673511293634,
+   "ttftP50Ms": 419,
+   "completionTokens": 551,
+   "durationMs": 12594
+  },
+  {
+   "concurrency": 2,
+   "aggregateTokS": 71.92072970667367,
+   "perStreamTokS": 37.32568287731641,
+   "ttftP50Ms": 424.5,
+   "completionTokens": 1096,
+   "durationMs": 15455
+  },
+  {
+   "concurrency": 4,
+   "aggregateTokS": 109.89955417091905,
+   "perStreamTokS": 30.038879364581916,
+   "ttftP50Ms": 753,
+   "completionTokens": 2046,
+   "durationMs": 18837
+  }
+ ]
+}

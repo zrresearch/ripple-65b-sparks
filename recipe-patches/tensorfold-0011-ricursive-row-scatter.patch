@@ -1,0 +1,148 @@
+From 95fe7632f005ccec2384f2ba7a367e47d6ffcf86 Mon Sep 17 00:00:00 2001
+From: operator <225459632+operator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:34:33 +0000
+Subject: [PATCH] ricursive: prompt rows' partials at three ranks or more by a
+ row reduce-scatter (same bits, half the bytes)
+
+At four ranks each o_proj and down_proj gathered every rank's whole fp32 partial (three times a rank's share of
+bytes in, per exchange). cuda.rank_scatter sends each rank only its share of the rows, sums them in rank order with
+tf_rank_sum (the adds and order of tf_ripple_rank_sum), and the summed shares go to every rank in one send/recv group:
+half the bytes, the same bits. Prompt calls (more than 16 rows) at three ranks or more; TF_RICURSIVE_SCATTER=0 keeps
+the gather. Four GB10s: cold prefill 557-571 -> 643 tok/s at 7.6K tokens, 534-542 -> 610 at 30K; greedy replies
+byte-identical to the four-rank goldens (code, tool call, chat, a 7,240-token lookup; DFlash2 on).
+---
+ zig/src/families/ricursive/cuda_forward.zig | 16 ++++++-
+ zig/src/families/ricursive/cuda_scatter.zig | 52 +++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/families/ricursive/cuda_scatter.zig
+
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index 82f56f0cf..f91d7f94f 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -7,6 +7,7 @@ const config = @import("config.zig");
+ const weights = @import("cuda_weights.zig");
+ const Kernels = @import("cuda_kernels.zig").Kernels;
+ const kept = @import("cuda_kept.zig");
++const Scatter = @import("cuda_scatter.zig").Scatter;
+ 
+ const hd = config.head_dim;
+ const Tree = cuda.tree_attention.TreeAttention;
+@@ -112,6 +113,7 @@ pub const Model = struct {
+     tree: Tree,
+     k: Kernels,
+     group: ?cuda.tp_group.Group = null,
++    scatter: ?Scatter = null, // three ranks or more: prompt rows' partials by the row scatter (cuda_scatter.zig)
+     caches: []Cache = &.{},
+     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+     // a rank's heads, key heads, FFN width and vocab share
+@@ -156,6 +158,8 @@ pub const Model = struct {
+             m.group = try cuda.tp_group.Group.open(d, o.place.rank, world);
+             if (o.roce and world == 2) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
+             if (o.roce and world > 2) try roce_multi.open(gpa, io, d, &m.group.?, true);
++            const off = if (std.c.getenv("TF_RICURSIVE_SCATTER")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
++            if (world > 2 and !off) m.scatter = try Scatter.init(d, max_rows, world, c.hidden);
+         }
+         m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
+         m.dense = try cuda.exl3.Dense.load(d);
+@@ -281,6 +285,7 @@ pub const Model = struct {
+         m.norms.unload();
+         m.dense.unload();
+         m.w.deinit();
++        if (m.scatter) |*x| x.deinit();
+         if (m.group) |*g| g.close();
+         m.stream.deinit();
+         m.gpa.destroy(m);
+@@ -424,6 +429,13 @@ pub const Model = struct {
+         }
+     }
+ 
++    /// n rows of o_proj or down_proj partials (parts + rank * n rows) summed over the ranks into `into`.
++    fn sumParts(m: *Model, into: u64, n: usize) !void {
++        const h = m.c.hidden;
++        if (m.scatter) |*x| if (n > tree_rows) return x.sum(&m.group.?, m.stream, m.b.parts + m.rank() * n * h * 4, n, h, into);
++        try m.sumRanks(into, n * h * 4);
++    }
++
+     /// `bytes` a rank at parts + rank * bytes gathered from every rank, then summed in rank order into `into`.
+     pub fn sumRanks(m: *Model, into: u64, bytes: usize) !void {
+         const g = &m.group.?;
+@@ -563,7 +575,7 @@ pub const Model = struct {
+             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
+             if (world == 1) try m.dense.prompt(s, l.o, b.gated, .f16, n, b.a, .f32) else {
+                 try m.dense.prompt(s, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+-                try m.sumRanks(b.a, n * h * 4);
++                try m.sumParts(b.a, n);
+             }
+             try m.k.normAdd(s, b.a, l.post_attn, b.x, n, h, c.eps);
+             try m.norms.rms(s, b.x, .f32, l.pre_ffn, b.y, .f16, n, h, c.eps);
+@@ -573,7 +585,7 @@ pub const Model = struct {
+             try m.k.swiglu(s, b.gu, gu_up, b.act, n * m.ff, c.clamp);
+             if (world == 1) try m.dense.prompt(s, l.down, b.act, .f16, n, b.a, .f32) else {
+                 try m.dense.prompt(s, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
+-                try m.sumRanks(b.a, n * h * 4);
++                try m.sumParts(b.a, n);
+             }
+             try m.k.normAdd(s, b.a, l.post_ffn, b.x, n, h, c.eps);
+             if (m.tapk) |*tk| for (m.taps[0..m.n_taps], 0..) |t, ti| if (t == li) try tk.taps(s, b.x, pos, slots, m.tap_ring, tap_rows, m.n_taps, ti, h, n);
+diff --git a/zig/src/families/ricursive/cuda_scatter.zig b/zig/src/families/ricursive/cuda_scatter.zig
+new file mode 100644
+index 000000000..d454f1500
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_scatter.zig
+@@ -0,0 +1,52 @@
++//! Prompt rows' o_proj and down_proj partials at three ranks or more: a reduce-scatter by rows in rank order (each rank
++//! adds its share of the rows from every rank, tf_rank_sum: the same adds in the same order as tf_ripple_rank_sum), then
++//! each rank sends its summed rows to every other. A rank receives half the bytes of gathering every whole partial, and
++//! the sums keep their bits. TF_RICURSIVE_SCATTER=0 keeps the gather.
++const std = @import("std");
++const cuda = @import("cuda");
++
++const share = cuda.rank_scatter.share;
++
++pub const Scatter = struct {
++    rs: cuda.rank_scatter.RankScatter,
++    scratch: cuda.DeviceBuffer,
++
++    /// Up to `rows` rows of `width` fp32 values a call, at `world` ranks.
++    pub fn init(d: *const cuda.Driver, rows: usize, world: usize, width: usize) !Scatter {
++        var rs = try cuda.rank_scatter.RankScatter.load(d);
++        errdefer rs.unload();
++        return .{ .rs = rs, .scratch = try cuda.DeviceBuffer.alloc(d, cuda.rank_scatter.scratchBytes(rows, world, width)) };
++    }
++
++    pub fn deinit(x: *Scatter) void {
++        x.scratch.free();
++        x.rs.unload();
++    }
++
++    /// Every rank's `partial` [rows][width] fp32 summed in rank order into `into` [rows][width], on `s`.
++    pub fn sum(x: *const Scatter, g: *const cuda.tp_group.Group, s: cuda.Stream, partial: u64, rows: usize, width: usize, into: u64) !void {
++        const mine = share(rows, g.world, g.rank);
++        try x.rs.run(&g.lib, g.comm, g.world, g.rank, s, partial, rows, width, x.scratch.ptr, into + mine[0] * width * 4);
++        try g.lib.group(Spread{ .g = g, .s = s, .into = into, .rows = rows, .width = width }, Spread.post);
++    }
++
++    /// The summed shares to every rank: one send/recv group, each share straight into its rows of `into`.
++    const Spread = struct {
++        g: *const cuda.tp_group.Group,
++        s: cuda.Stream,
++        into: u64,
++        rows: usize,
++        width: usize,
++
++        fn post(t: Spread) anyerror!void {
++            const mine = share(t.rows, t.g.world, t.g.rank);
++            const row = t.width * 4;
++            for (0..t.g.world) |peer| {
++                if (peer == t.g.rank) continue;
++                const theirs = share(t.rows, t.g.world, peer);
++                if (mine[1] > mine[0]) try t.g.send(t.s, t.into + mine[0] * row, (mine[1] - mine[0]) * row, peer);
++                if (theirs[1] > theirs[0]) try t.g.recv(t.s, t.into + theirs[0] * row, (theirs[1] - theirs[0]) * row, peer);
++            }
++        }
++    };
++};
+-- 
+2.43.0
+

@@ -1,0 +1,63 @@
+[14:20:37] part A: Phase 3's configs + 1M retrieval (recipe start.sh)
+== plain: start 21:20:37
+[21:20:55] up after 15 s
+[21:20:55] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 28.54 GiB; 1 stream at once, 16.14 GiB each at a 1048576-token window, of 82.3 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[21:20:56] MemAvailable GiB: head 86.2, user@<addr> 86.3, user@<addr> 86.3, user@<addr> 86.2
+[21:20:57] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[21:20:57] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding 17.64 tok/s [487, 487]
+agent tool call 19.06 tok/s [512, 512]
+chat 17.37 tok/s [512, 512]
+-- vs Phase 3:
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[21:24:52] stopped
+== drafted: start 21:24:52
+[21:25:14] up after 20 s
+[21:25:14] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 31.05 GiB; 1 stream at once, 16.22 GiB each at a 1048576-token window, of 79.5 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[21:25:15] MemAvailable GiB: head 83.4, user@<addr> 83.6, user@<addr> 83.7, user@<addr> 83.5
+[21:25:16] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[21:25:16] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+coding 57.39 tok/s [487, 487]
+agent tool call 50.99 tok/s [512, 512]
+chat 25.12 tok/s [512, 512]
+-- vs Phase 3:
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[21:27:12] stopped
+== streams4: start 21:27:12
+[21:27:34] up after 20 s
+[21:27:34] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 30.93 GiB; 4 streams at once, 4.22 GiB each at a 262144-token window, of 79.6 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[21:27:35] MemAvailable GiB: head 83.5, user@<addr> 83.8, user@<addr> 83.8, user@<addr> 83.6
+[21:27:36] warm-up: 'Hello there, how are you?' {'prompt_tokens': 14, 'completion_tokens': 8, 'total_tokens': 22, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}}
+[21:27:36] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+{'coding': 384, 'agent': 30, 'chat': 135, 'long': 384}
+-- vs Phase 3:
+coding: DIFFERS (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[21:28:01] stopped
+== 1M retrieval: start 21:28:01
+[21:28:23] up after 20 s
+[21:28:23] engine: CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 31.05 GiB; 1 stream at once, 16.22 GiB each at a 1048576-token window, of 79.4 GiB left after a 4.0 GiB reserve; prompts in passes of up to 1024 rows, a 16.0 GiB prompt cache; own glue kernels
+[21:28:25] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+{"prompt_tokens": 1015070, "first_token_s": 2840.4, "prompt_tok_s": 357.4, "completion_tokens": 65, "decode_tok_s": 11.63, "found": true, "answer": "7319-KESTREL-0442"}
+[22:15:59] stopped
+== P4 4x DONE 22:15:59
+[15:15:59] part B: 16 x 128K launcher, SparkMan decode / prose / prefill
+[15:16:29] serving
+[15:17:59] res-decode-code.txt (bench-mwgytjyv-968c): completed None
+1 at once:   25.7 tok/s aggregate,  25.7 per request, TTFT  383 ms
+2 at once:   47.9 tok/s aggregate,  24.5 per request, TTFT  550 ms
+4 at once:   65.8 tok/s aggregate,  19.0 per request, TTFT 1153 ms
+8 at once:  113.2 tok/s aggregate,  14.4 per request, TTFT 2105 ms
+16 at once:  188.9 tok/s aggregate,  11.9 per request, TTFT 3864 ms
+[15:35:35] res-prefill.txt (bench-mwgzfjuo-d3a8): completed None
+[15:35:45] P4 BENCH 4X DONE

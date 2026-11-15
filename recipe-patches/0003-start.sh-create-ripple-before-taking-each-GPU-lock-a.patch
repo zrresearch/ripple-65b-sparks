@@ -1,7 +1,7 @@
-From a47e3f0fef4e877b1339996185699320c1b831e2 Mon Sep 17 00:00:00 2001
+From c6b882a6b324e1820380609bd26c5d7e6217a0d7 Mon Sep 17 00:00:00 2001
 From: operator <225459632+operator@users.noreply.github.com>
-Date: Wed, 11 Nov 2026 22:35:28 +0000
-Subject: [PATCH] start.sh: create ~/ripple before taking each GPU lock (a
+Date: Wed, 11 Nov 2026 22:35:23 +0000
+Subject: [PATCH 3/4] start.sh: create ~/ripple before taking each GPU lock (a
  fresh worker read as busy)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

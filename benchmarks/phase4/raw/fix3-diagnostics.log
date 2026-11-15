@@ -1,0 +1,54 @@
+[zig-out-ovl prose] 16 at once:  166.8 tok/s aggregate,  10.4 per request, TTFT 4101 ms
+   tokens 49152, rounds 49104, drafted 0 (0.00 a round per stream-round), accepted 0 (0.0%), tokens a stream-round 1.00
+[zig-out-ovl prose] 8 at once:   88.7 tok/s aggregate,  12.3 per request, TTFT 1542 ms
+   tokens 24576, rounds 15799, drafted 17749 (1.12 a round per stream-round), accepted 8754 (49.3%), tokens a stream-round 1.56
+[zig-out-r64 prose] 16 at once:  116.5 tok/s aggregate,   7.7 per request, TTFT 4265 ms
+   tokens 49152, rounds 27140, drafted 59506 (2.19 a round per stream-round), accepted 21964 (36.9%), tokens a stream-round 1.81
+[zig-out-r64 prose] 8 at once:   91.4 tok/s aggregate,  12.1 per request, TTFT 1492 ms
+   tokens 24576, rounds 13480, drafted 28609 (2.12 a round per stream-round), accepted 11073 (38.7%), tokens a stream-round 1.82
+DIAG DONE
+
+[exited with code 0]
+[07:49:36] serving Ripple-65B-Preview-4x at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+info: rank 0: TF_RICURSIVE_ROCE (multirank): gathers up to 1024 KiB a rank on the wire, its probe equal to NCCL's: HCA 0 QP RTS; posted 3, completed 3; HCA 1 QP RTS; posted 3, completed 3; reaped 0 (flushed 0), still posted 0
+info: rank 0: TF_RICURSIVE_ROCE (multirank): the first gather is on the wire (20480 bytes a rank)
+[zig-out-ovl mailbox 1 MiB] 16 at once:  165.8 tok/s aggregate,  10.4 per request, TTFT 4145 ms
+[zig-out-ovl mailbox 1 MiB] 8 at once:   90.2 tok/s aggregate,  12.4 per request, TTFT 1565 ms
+[07:59:53] serving Ripple-65B-Preview-4x at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+info: rank 0: TF_RICURSIVE_ROCE (multirank): gathers up to 1024 KiB a rank on the wire, its probe equal to NCCL's: HCA 0 QP RTS; posted 3, completed 3; HCA 1 QP RTS; posted 3, completed 3; reaped 0 (flushed 0), still posted 0
+info: rank 0: TF_RICURSIVE_ROCE (multirank): the first gather is on the wire (20480 bytes a rank)
+[zig-out-r64 mailbox 1 MiB] 16 at once:  114.5 tok/s aggregate,   7.8 per request, TTFT 4098 ms
+[zig-out-r64 mailbox 1 MiB] 8 at once:   91.3 tok/s aggregate,  12.5 per request, TTFT 1469 ms
+[08:11:56] stopped
+
+[exited with code 0]
+[08:16:47] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+info: ricursive: target windows 1 / 2 / 16 / 32 / 64 rows 58.6 / 60.9 / 75.5 / 95.8 / 127.7 ms, a draft block 13.4 ms
+coding: identical (384 / 384 tokens)
+agent: identical (30 / 30 tokens)
+chat: identical (135 / 135 tokens)
+long: identical (384 / 384 tokens)
+[h16 prose] 16 at once:  136.6 tok/s aggregate,   9.0 per request, TTFT 4074 ms
+   drafted 1.91 per stream-round, accepted 39.3%, tokens per stream-round 1.75
+[h16 prose] 8 at once:   97.3 tok/s aggregate,  13.0 per request, TTFT 1469 ms
+   drafted 1.81 per stream-round, accepted 41.7%, tokens per stream-round 1.76
+
+[exited with code 0]
+[08:32:29] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+info: ricursive: a hold pass of 1 / 4 / 16 streams at depth 15: 14.6 / 22.1 / 54.6 ms
+info: ricursive: target windows 1 / 2 / 16 / 32 / 64 rows 58.4 / 60.4 / 76.0 / 96.9 / 129.9 ms, a draft block 13.3 ms
+coding: identical (384 / 384 tokens) agent: identical (30 / 30 tokens) chat: identical (135 / 135 tokens) long: identical (384 / 384 tokens) 
+[hold-cost prose] 16 at once:  133.7 tok/s aggregate,   9.1 per request, TTFT 4089 ms
+   drafted 1.88 per stream-round, accepted 40.0%, tokens per stream-round 1.75
+[hold-cost prose] 8 at once:   96.9 tok/s aggregate,  13.1 per request, TTFT 1483 ms
+   drafted 2.20 per stream-round, accepted 36.0%, tokens per stream-round 1.79
+
+[exited with code 0]
+[08:50:34] serving Ripple-65B-Preview at http://sw-head.ito.umt.edu:8888/v1 on 4 Sparks
+coding: identical (384 / 384 tokens) agent: identical (30 / 30 tokens) chat: identical (135 / 135 tokens) long: identical (384 / 384 tokens) 
+[batched absorb prose] 16 at once:  144.9 tok/s aggregate,   9.6 per request, TTFT 4066 ms
+   drafted 1.55 per stream-round, accepted 43.2%, tokens per stream-round 1.67
+[batched absorb prose] 8 at once:   97.6 tok/s aggregate,  13.6 per request, TTFT 1474 ms
+   drafted 1.73 per stream-round, accepted 41.5%, tokens per stream-round 1.72
+
+[exited with code 0]

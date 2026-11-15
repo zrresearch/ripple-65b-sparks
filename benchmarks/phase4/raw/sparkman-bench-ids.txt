@@ -1,0 +1,6 @@
+ripple-p4/id-*.txt bench-mwfxj38o-bc1a
+bench-mwfv8cjc-8200
+bench-mwfuwrtm-20d1
+ripple-nvfp4/id-*.txt bench-mwfwc5ih-bcbe
+bench-mwfvuny8-bb17
+bench-mwgmqxkq-3662 fix3b old code decode; bench-mwgn57bj-e8b8 fix3b fixed code decode; bench-mwgn8oum-78cd fix3b fixed code16 x2; bench-mwgnb6ct-fc11 fix3b old code16 x2
