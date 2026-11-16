@@ -448,7 +448,7 @@ footer { font-family: var(--f-sans); font-size: 13px; color: var(--ink-2); }
 </div>
 
 <h2 id="learned">What we learned</h2>
-<p><b>A dense model gains from more Sparks, but not for free.</b> Every Spark added cuts the weights each one reads per token, and one stream got 1.7 times faster from two Sparks to four. What it does not cut is the exchange in every layer, which is why the gain is short of 2 and smaller still with the draft model.</p>
+<p><b>Four Sparks made one stream 1.7 times faster than two.</b> Each added Spark cuts the weights each one reads per token. The exchange between Sparks in every layer does not shrink, so the gain is short of 2, and smaller still with the draft model.</p>
 <p><b>Most of the speed was in the software.</b> The first four-Spark build read prompts only 38% faster than two Sparks and decoded eight streams slower than four. Neither was a hardware limit: one was a prompt path that re-decoded its weights for every block of rows and an exchange that sent every rank every other rank's full partial results, the other a 16-row cap and a pricing rule that charged the wrong rounds. With the same changes, two Sparks now read prompts faster than four did before.</p>
 <p><b>Rerunning the suite is worth it.</b> Rerunning our test suite on the final build showed that the engine changes left quality alone, and it also found two faults in the suite itself that a single run could not show. Every model we test from now on gets the fixed version.</p>
 
