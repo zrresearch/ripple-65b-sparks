@@ -441,7 +441,8 @@ footer { font-family: var(--f-sans); font-size: 13px; color: var(--ink-2); }
       <tr><td>Terminal-Bench 2 through its reference agent, and Cybench through Codex</td><td>open; waits on how to set the agents' time limits for this speed</td></tr>
       <tr><td>A pooled cache, so long and many streams fit together</td><td>open</td></tr>
       <tr><td>The exchanges, now 28% of prompt time</td><td>open</td></tr>
-      <tr><td>The engine changes offered back to TensorFold; our pack published</td><td>open</td></tr>
+      <tr><td>The recipe published, and offered to the two-Spark recipe</td><td>done</td></tr>
+      <tr><td>The engine changes offered to TensorFold</td><td>open; waits on the two-Spark pull requests</td></tr>
     </tbody>
     <caption>Table 12. Work done and planned.</caption>
   </table>
@@ -463,7 +464,7 @@ footer { font-family: var(--f-sans); font-size: 13px; color: var(--ink-2); }
 </ul>
 
 <h2 id="appendix">Appendix: reproducing this work</h2>
-<p>The recipe is ajensenwaud's <a href="https://github.com/ajensenwaud/ripplespark-2dgx">two-Spark recipe</a> with four patches from the <a href="https://github.com/zrresearch/ripple-65b-sparks">research repository</a> applied by <code>git am</code>, in order: four-rank support and the list of workers; per-rank RoCE device names; a fix for a Spark's first start; and the five engine changes. Its build script then applies the TensorFold patches <code>tensorfold-0010</code> to <code>0015</code> to TensorFold v1.2.3 and checks the result against the pinned source tree before building. On a switch, set the RoCE GID index the switch uses (5 for us) and each rank's devices if a Spark names them differently.</p>
+<p>The recipe is <a href="https://github.com/zrresearch/ripplespark-4dgx">zrresearch/ripplespark-4dgx</a>, ajensenwaud's <a href="https://github.com/ajensenwaud/ripplespark-2dgx">two-Spark recipe</a> with four commits on top: four-rank support and the list of workers; per-rank RoCE device names; a fix for a Spark's first start; and the five engine changes. Its README covers two and four Sparks. The same commits are offered to the two-Spark recipe, and are also in the <a href="https://github.com/zrresearch/ripple-65b-sparks">research repository</a> as patches. Its build script applies TensorFold patches 0010 to 0015 to TensorFold v1.2.3 and checks the result against the pinned source tree before building. On a switch, set the RoCE GID index the switch uses (5 for us) and each rank's devices if a Spark names them differently.</p>
 <p>Each speed figure has its script and raw output under <code>benchmarks/</code>, with every Phase 4 run recorded in <code>benchmarks/phase4/RESULTS.md</code>. The quality suite and its per-item results are in <a href="https://github.com/zrresearch/evals">zrresearch/evals</a>, under the labels <code>ripple-65b-4x</code> (first build), <code>ripple-65b-4x-p4</code> and <code>ripple-65b-4x-p4-s2</code> (final build).</p>
 <div class="tbl">
   <table>
@@ -473,7 +474,8 @@ footer { font-family: var(--f-sans); font-size: 13px; color: var(--ink-2); }
       <tr><td>Reference pack</td><td><code>ajensenwaud/Ripple-65B-Preview-exl3-5.0bpw</code> @ <code>1d260f75</code></td></tr>
       <tr><td>Quantizer</td><td>ExLlamaV3 1.6.6 with the <code>feat/ricursive</code> branch @ <code>d71a6644</code></td></tr>
       <tr><td>Two-Spark engine</td><td>TensorFold branch <code>ricursive-tp2-dflash2</code> @ <code>a0607642</code> (pull requests #2522 and #2523)</td></tr>
-      <tr><td>Two-Spark recipe</td><td><a href="https://github.com/ajensenwaud/ripplespark-2dgx">ajensenwaud/ripplespark-2dgx</a></td></tr>
+      <tr><td>Two-Spark recipe</td><td><a href="https://github.com/ajensenwaud/ripplespark-2dgx">ajensenwaud/ripplespark-2dgx</a> @ e76bcfd</td></tr>
+      <tr><td>Our recipe</td><td><a href="https://github.com/zrresearch/ripplespark-4dgx">zrresearch/ripplespark-4dgx</a> @ 47bf061</td></tr>
       <tr><td>Final engine</td><td>TensorFold v1.2.3 with the recipe's 15 patches (our four-rank patch and the five engine changes), source tree <code>de18a25b</code></td></tr>
       <tr><td>Test suite</td><td>zrresearch/evals, versions 2026.11-1 and 2026.11-2; Inspect AI 0.3.289</td></tr>
     </tbody>
